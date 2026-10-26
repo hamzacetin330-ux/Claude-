@@ -266,7 +266,7 @@ public class MainActivity extends Activity {
         int n = 1;
         for (String line : manualLinks.getText().toString().split("\\s+")) {
             line = line.trim();
-            if (line.startsWith("http")) chosen.add(new Item("extra link " + n++, line, true, true));
+            if (line.startsWith("http")) chosen.add(new Item("extra link " + n++, line));
         }
         if (chosen.isEmpty()) {
             Toast.makeText(this, "Nothing to install. Press \"Find the files\" first.", Toast.LENGTH_LONG).show();

@@ -16,9 +16,10 @@ import android.os.PowerManager;
 import org.apache.commons.compress.PasswordRequiredException;
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZFile;
-import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
-import org.apache.commons.compress.archivers.zip.ZipFile;
 import org.apache.commons.compress.utils.MultiReadOnlySeekableByteChannel;
+import net.lingala.zip4j.exception.ZipException;
+import net.lingala.zip4j.model.FileHeader;
+
 import org.json.JSONObject;
 
 import java.io.File;
@@ -37,7 +38,6 @@ import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -142,7 +142,7 @@ public class InstallService extends Service {
             if (Progress.stopRequested) return;
             Item item = items.get(i);
             Progress.itemIndex = i;
-            String key = target.getAbsolutePath() + "|" + item.url;
+            String key = target.getAbsolutePath() + "|" + item.key();
             if (done.contains(key)) continue;
 
             String prefix = "(" + (i + 1) + "/" + items.size() + ") ";
@@ -232,25 +232,64 @@ public class InstallService extends Service {
 
     // ---------------------------------------------------------------- downloading
 
-    /** Returns the finished file, or null if the user pressed Stop. */
-    private File download(Item item, File dir, int index, String prefix) throws Exception {
-        String prefix2 = prefix + "Downloading " + item.label;
-        IOException last = null;
-        for (int attempt = 0; attempt < 8; attempt++) {
-            if (Progress.stopRequested) return null;
-            try {
-                return downloadOnce(item, dir, index, prefix2);
-            } catch (IOException e) {
-                last = e;
-                setStatus(prefix2 + "\nConnection problem, retrying (" + (attempt + 1) + "/8)...", -1);
-                Thread.sleep(Math.min(60000, 3000L << attempt));
-            }
+    /** A mirror that will not work no matter how often we retry (web page, 404, bad md5...). */
+    private static final class MirrorFailed extends IOException {
+        MirrorFailed(String message) {
+            super(message);
         }
-        throw last;
     }
 
-    private File downloadOnce(Item item, File dir, int index, String status) throws Exception {
-        String url = LinkScraper.isYandex(item.url) ? resolveYandex(item.url) : item.url;
+    /** Returns the finished (and md5-checked) file, or null if the user pressed Stop. */
+    private File download(Item item, File dir, int index, String prefix) throws Exception {
+        String status = prefix + "Downloading " + item.label;
+        File okFile = new File(dir, String.format(Locale.ROOT, "%02d.ok", index));
+        File nameFile = new File(dir, String.format(Locale.ROOT, "%02d.name", index));
+        if (okFile.exists() && nameFile.exists()) {
+            File finished = new File(dir, readSmall(nameFile));
+            if (finished.exists()) return finished;
+        }
+
+        List<String> problems = new ArrayList<>();
+        for (int m = 0; m < item.urls.size(); m++) {
+            String mirror = item.urls.get(m);
+            String mirrorStatus = item.urls.size() > 1
+                    ? status + " (mirror " + (m + 1) + "/" + item.urls.size() + ")" : status;
+            for (int attempt = 0; attempt < 5; attempt++) {
+                if (Progress.stopRequested) return null;
+                try {
+                    File f = downloadOnce(mirror, dir, index, mirrorStatus);
+                    if (f == null) return null;
+                    if (item.md5 != null) {
+                        setStatus(mirrorStatus + "\nChecking the file...", -1);
+                        String got = md5(f);
+                        if (got == null) return null;
+                        if (!got.equalsIgnoreCase(item.md5)) {
+                            f.delete();
+                            nameFile.delete();
+                            throw new MirrorFailed("the downloaded file was damaged (md5 did not match)");
+                        }
+                    }
+                    writeSmall(okFile, "ok");
+                    return f;
+                } catch (MirrorFailed e) {
+                    problems.add("mirror " + (m + 1) + ": " + e.getMessage());
+                    new File(dir, String.format(Locale.ROOT, "%02d.part", index)).delete();
+                    break;
+                } catch (IOException e) {
+                    if (attempt == 4) {
+                        problems.add("mirror " + (m + 1) + ": " + e.getMessage());
+                        break;
+                    }
+                    setStatus(mirrorStatus + "\nConnection problem, retrying (" + (attempt + 1) + "/4)...", -1);
+                    Thread.sleep(Math.min(60000, 3000L << attempt));
+                }
+            }
+        }
+        throw new IOException("Could not download " + item.label + "\n" + String.join("\n", problems));
+    }
+
+    private File downloadOnce(String mirror, File dir, int index, String status) throws Exception {
+        String url = resolve(mirror);
 
         File part = new File(dir, String.format(Locale.ROOT, "%02d.part", index));
         File nameFile = new File(dir, String.format(Locale.ROOT, "%02d.name", index));
@@ -270,8 +309,18 @@ public class InstallService extends Service {
             c = open(url, 0);
             code = c.getResponseCode();
         }
+        if (code == 404 || code == 403 || code == 410 || code == 401) {
+            c.disconnect();
+            throw new MirrorFailed("server answered HTTP " + code);
+        }
         if (code != 200 && code != 206) {
-            throw new IOException("Server answered HTTP " + code + " for " + item.label);
+            c.disconnect();
+            throw new IOException("server answered HTTP " + code);
+        }
+        String type = c.getContentType();
+        if (type != null && type.toLowerCase(Locale.ROOT).startsWith("text/html")) {
+            c.disconnect();
+            throw new MirrorFailed("it opened a web page instead of the file");
         }
         if (code == 200) have = 0; // server ignored Range: start over
 
@@ -300,7 +349,7 @@ public class InstallService extends Service {
                     setStatus(status + "\n" + mb(got) + (total > 0 ? " / " + mb(total) : ""), permille);
                 }
             }
-            if (total > 0 && got < total) throw new IOException("Connection closed early");
+            if (total > 0 && got < total) throw new IOException("connection closed early");
         } finally {
             c.disconnect();
         }
@@ -309,6 +358,41 @@ public class InstallService extends Service {
         finished.delete();
         if (!part.renameTo(finished)) throw new IOException("Cannot rename " + part);
         return finished;
+    }
+
+    /** Turns a mirror's share link into a link that downloads the file itself. */
+    private static String resolve(String mirror) throws IOException {
+        if (LinkScraper.isYandex(mirror)) return resolveYandex(mirror);
+        if (LinkScraper.isGoogleDrive(mirror)) {
+            Matcher m = Pattern.compile("(?:/d/|[?&]id=)([\\w-]{10,})").matcher(mirror);
+            if (m.find()) {
+                return "https://drive.usercontent.google.com/download?id=" + m.group(1)
+                        + "&export=download&confirm=t";
+            }
+        }
+        Matcher pd = Pattern.compile("pixeldrain\\.com/u/([\\w-]+)").matcher(mirror);
+        if (pd.find()) return "https://pixeldrain.com/api/file/" + pd.group(1) + "?download";
+        return mirror;
+    }
+
+    /** md5 of a file as hex, or null if the user pressed Stop. */
+    private static String md5(File f) throws IOException {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("MD5");
+            byte[] buf = new byte[BUFFER];
+            try (InputStream in = new java.io.FileInputStream(f)) {
+                int r;
+                while ((r = in.read(buf)) > 0) {
+                    if (Progress.stopRequested) return null;
+                    md.update(buf, 0, r);
+                }
+            }
+            StringBuilder sb = new StringBuilder();
+            for (byte b : md.digest()) sb.append(String.format(Locale.ROOT, "%02x", b));
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
     }
 
     private static HttpURLConnection open(String url, long from) throws IOException {
@@ -336,6 +420,7 @@ public class InstallService extends Service {
                 + URLEncoder.encode(publicUrl, "UTF-8");
         HttpURLConnection c = open(api, 0);
         try {
+            if (c.getResponseCode() == 404) throw new MirrorFailed("Yandex Disk says the file is gone");
             if (c.getResponseCode() != 200) {
                 throw new IOException("Yandex Disk answered HTTP " + c.getResponseCode()
                         + " (the link may be over its download limit; try again later)");
@@ -393,7 +478,7 @@ public class InstallService extends Service {
             if (in.read(magic) < 4) throw new IOException(first.getName() + " is too small");
         }
         if (magic[0] == 'P' && magic[1] == 'K') {
-            extractZip(parts, target, status);
+            extractZip(parts, target, password, status);
         } else if ((magic[0] & 0xff) == 0x37 && (magic[1] & 0xff) == 0x7A && (magic[2] & 0xff) == 0xBC) {
             extract7z(parts, target, password, status);
         } else if (magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r') {
@@ -416,27 +501,29 @@ public class InstallService extends Service {
                 : MultiReadOnlySeekableByteChannel.forFiles(parts.toArray(new File[0]));
     }
 
-    private void extractZip(List<File> parts, File target, String status) throws IOException {
-        try (ZipFile zip = ZipFile.builder().setSeekableByteChannel(channel(parts)).get()) {
+    private void extractZip(List<File> parts, File target, String password, String status) throws IOException {
+        if (parts.size() > 1) throw new IOException("Split zip archives are not supported");
+        char[] pw = password == null || password.isEmpty() ? null : password.toCharArray();
+        try (net.lingala.zip4j.ZipFile zip = new net.lingala.zip4j.ZipFile(parts.get(0), pw)) {
+            List<FileHeader> headers = zip.getFileHeaders();
             long total = 0;
-            for (Enumeration<ZipArchiveEntry> e = zip.getEntries(); e.hasMoreElements(); ) {
-                total += Math.max(0, e.nextElement().getSize());
-            }
+            for (FileHeader h : headers) total += Math.max(0, h.getUncompressedSize());
             long done = 0;
-            for (Enumeration<ZipArchiveEntry> e = zip.getEntries(); e.hasMoreElements(); ) {
+            for (FileHeader h : headers) {
                 if (Progress.stopRequested) return;
-                ZipArchiveEntry entry = e.nextElement();
-                File out = safeFile(target, entry.getName());
-                if (entry.isDirectory()) {
+                File out = safeFile(target, h.getFileName());
+                if (h.isDirectory()) {
                     out.mkdirs();
                     continue;
                 }
-                if (!zip.canReadEntryData(entry)) {
-                    throw new IOException(entry.getName() + " is password protected or uses an "
-                            + "unsupported zip method; this app can only open passwords on 7z archives");
-                }
-                try (InputStream in = zip.getInputStream(entry)) {
+                try (InputStream in = zip.getInputStream(h)) {
                     done = writeEntry(in, out, done, total, status);
+                } catch (ZipException e) {
+                    if (e.getType() == ZipException.Type.WRONG_PASSWORD) {
+                        throw new IOException(parts.get(0).getName().replaceFirst("^\\d\\d-", "")
+                                + ": the password is wrong (or missing). Check the password box.", e);
+                    }
+                    throw e;
                 }
             }
         }

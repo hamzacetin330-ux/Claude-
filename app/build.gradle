@@ -10,8 +10,8 @@ android {
         applicationId 'org.umineko.installer'
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName '1.0'
+        versionCode 2
+        versionName '1.1'
     }
 
     signingConfigs {
@@ -51,4 +51,5 @@ dependencies {
     implementation 'org.jsoup:jsoup:1.18.1'
     implementation 'org.apache.commons:commons-compress:1.27.1'
     implementation 'org.tukaani:xz:1.10'
+    implementation 'net.lingala.zip4j:zip4j:2.11.5'
 }
