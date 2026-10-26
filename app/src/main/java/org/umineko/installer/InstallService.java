@@ -72,6 +72,9 @@ public class InstallService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Big speed-ups for the encrypted, many-file resource archive (see CachingAes256Decoder).
+        org.apache.commons.compress.archivers.sevenz.CachingAes256Decoder.install();
+        org.tukaani.xz.ArrayCache.setDefaultCache(org.tukaani.xz.BasicArrayCache.getInstance());
         if (intent == null || Progress.running) return START_NOT_STICKY;
         notifications = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= 26) {
@@ -471,7 +474,11 @@ public class InstallService extends Service {
 
     // ---------------------------------------------------------------- extracting
 
+    /** When the current extraction started, for the speed / time-left estimate. */
+    private long extractStartMs;
+
     private void extract(List<File> parts, File target, String password, String status) throws IOException {
+        extractStartMs = System.currentTimeMillis();
         File first = parts.get(0);
         byte[] magic = new byte[6];
         try (InputStream in = new java.io.FileInputStream(first)) {
@@ -586,11 +593,24 @@ public class InstallService extends Service {
                 long now = System.currentTimeMillis();
                 if (now - lastUpdate > 500) {
                     lastUpdate = now;
-                    setStatus(status + "\n" + out.getName(), total > 0 ? (int) (done * 1000 / total) : -1);
+                    setStatus(status + "\n" + extractEta(done, total, now) + out.getName(),
+                            total > 0 ? (int) (done * 1000 / total) : -1);
                 }
             }
         }
         return done;
+    }
+
+    /** "42% · 35.0 MB/s · about 6 min left\n", or "" while there isn't enough data yet. */
+    private String extractEta(long done, long total, long now) {
+        long ms = now - extractStartMs;
+        if (total <= 0 || ms < 5000 || done <= 0) return "";
+        double perSec = done * 1000.0 / ms;
+        long left = (long) ((total - done) / perSec);
+        String time = left >= 3600 ? String.format(Locale.ROOT, "%dh %02dmin", left / 3600, left / 60 % 60)
+                : left >= 60 ? (left / 60) + " min" : left + " s";
+        return String.format(Locale.ROOT, "%d%%  \u00b7  %.1f MB/s  \u00b7  about %s left\n",
+                done * 100 / total, perSec / 1048576.0, time);
     }
 
     /** Refuses archive entries that try to escape the game folder ("../"). */
