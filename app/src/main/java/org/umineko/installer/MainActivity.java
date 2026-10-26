@@ -4,6 +4,17 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
+import android.content.res.ColorStateList;
+import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Icon;
+import android.text.TextUtils;
+import android.view.Gravity;
+import android.view.ViewGroup;
+import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Typeface;
@@ -58,6 +69,22 @@ public class MainActivity extends Activity {
     private ProgressBar progressBar;
     private TextView statusText;
     private TextView spaceText;
+    private TextView stepText;
+    private ProgressBar overallBar;
+    private Button findButton;
+    private LinearLayout selectRow;
+    private LinearLayout advanced;
+    private TextView advancedToggle;
+
+    // Colours (match res/values/styles.xml)
+    private static final int BG = 0xFF120D18;
+    private static final int CARD = 0xFF1E1626;
+    private static final int CARD_BORDER = 0xFF3A2A47;
+    private static final int GOLD = 0xFFE9C46A;
+    private static final int CRIMSON = 0xFF9E1B32;
+    private static final int TEXT = 0xFFF2EAF5;
+    private static final int MUTED = 0xFFA898B4;
+    private static final int OK = 0xFF7BD389;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -71,6 +98,7 @@ public class MainActivity extends Activity {
         String apk = prefs.getString("apk", null);
         if (apk != null && new File(apk).exists()) Progress.apkPath = apk;
         handler.post(tick);
+        offerShortcutOnce();
     }
 
     @Override
@@ -88,73 +116,143 @@ public class MainActivity extends Activity {
     // ---------------------------------------------------------------- UI
 
     private View buildUi() {
-        int pad = dp(16);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(pad, pad, pad, pad);
+        root.setPadding(dp(16), dp(20), dp(16), dp(32));
 
-        root.addView(text("This app downloads every Umineko Project file for Android, extracts them "
-                + "and puts them together in one folder, so you only have to press one button.", 15, false));
+        // Header
+        LinearLayout header = new LinearLayout(this);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        ImageView logo = new ImageView(this);
+        logo.setImageResource(R.mipmap.ic_launcher);
+        header.addView(logo, new LinearLayout.LayoutParams(dp(56), dp(56)));
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        titles.setPadding(dp(14), 0, 0, 0);
+        TextView title = text("Umineko Installer", 24, GOLD);
+        title.setTypeface(Typeface.create(Typeface.SERIF, Typeface.BOLD));
+        titles.addView(title);
+        titles.addView(text("Umineko Project for Android, all files in one go", 13, MUTED));
+        header.addView(titles);
+        root.addView(header);
+        root.addView(space(16));
 
-        permissionButton = button("1. Allow access to files", v -> askStoragePermission());
-        root.addView(permissionButton);
+        // 1. Permission
+        LinearLayout c1 = card(root, "1", "Allow file access",
+                "Needed to put the game files in your storage.");
+        permissionButton = primaryButton("Allow access", v -> askStoragePermission());
+        c1.addView(permissionButton);
 
-        root.addView(text("\nGame folder (where the files go):", 14, true));
+        // 2. Choose files
+        LinearLayout c2 = card(root, "2", "Choose the files",
+                "Reads the official downloads page and lists every file, in install order.");
+        c2.addView(label("Game folder"));
         targetDir = edit(prefs.getString("target",
                 new File(Environment.getExternalStorageDirectory(), "ONScripter-RU").getAbsolutePath()));
-        root.addView(targetDir);
-        spaceText = text("", 13, false);
-        root.addView(spaceText);
-
-        root.addView(text("\nDownloads page:", 14, true));
-        pageUrl = edit(prefs.getString("page", DEFAULT_PAGE));
-        root.addView(pageUrl);
-        root.addView(button("2. Find the files on the page", v -> findFiles()));
-
-        itemHeader = text("", 14, true);
-        root.addView(itemHeader);
+        c2.addView(targetDir);
+        spaceText = text("", 12, MUTED);
+        c2.addView(spaceText);
+        c2.addView(space(8));
+        findButton = primaryButton("Find the files", v -> findFiles());
+        c2.addView(findButton);
+        itemHeader = text("", 13, MUTED);
+        itemHeader.setPadding(0, dp(8), 0, 0);
+        c2.addView(itemHeader);
+        selectRow = new LinearLayout(this);
+        selectRow.addView(linkButton("Select all", v -> selectAll(true)));
+        selectRow.addView(linkButton("Select none", v -> selectAll(false)));
+        selectRow.setVisibility(View.GONE);
+        c2.addView(selectRow);
         itemList = new LinearLayout(this);
         itemList.setOrientation(LinearLayout.VERTICAL);
-        root.addView(itemList);
+        c2.addView(itemList);
 
-        root.addView(text("\nExtra links (optional, one per line, installed after the ones above in "
-                + "this order). Use this if a file was not found or only has a Mega mirror:", 13, false));
+        // 3. Install
+        LinearLayout c3 = card(root, "3", "Download & install",
+                "Big download (10+ GB). Use Wi-Fi and keep the device charging. "
+                        + "You can leave the app; progress shows in the notification.");
+        c3.addView(label("Archive password"));
+        password = edit(prefs.getString("password", DEFAULT_PASSWORD));
+        c3.addView(password);
+        deleteArchives = new CheckBox(this);
+        deleteArchives.setText("Delete archives after extracting (saves space)");
+        deleteArchives.setTextColor(TEXT);
+        deleteArchives.setChecked(prefs.getBoolean("delete", true));
+        c3.addView(deleteArchives);
+        c3.addView(space(8));
+        startButton = primaryButton("Download & install everything", v -> start());
+        c3.addView(startButton);
+
+        stepText = text("", 13, GOLD);
+        stepText.setTypeface(Typeface.DEFAULT_BOLD);
+        stepText.setPadding(0, dp(12), 0, dp(4));
+        c3.addView(stepText);
+        overallBar = bar();
+        c3.addView(overallBar);
+        progressBar = bar();
+        c3.addView(progressBar);
+        statusText = text("", 13, TEXT);
+        statusText.setTextIsSelectable(true);
+        statusText.setPadding(0, dp(6), 0, 0);
+        c3.addView(statusText);
+        stopButton = secondaryButton("Stop", v -> Progress.stopRequested = true);
+        c3.addView(stopButton);
+
+        // 4. Engine
+        LinearLayout c4 = card(root, "4", "Install the game engine",
+                "When the download is finished, install ONScripter-RU and start the game from it.");
+        apkButton = primaryButton("Install ONScripter-RU", v -> installApk());
+        c4.addView(apkButton);
+
+        // Advanced (collapsed)
+        advancedToggle = text("\u25B8  Advanced options", 14, MUTED);
+        advancedToggle.setPadding(dp(4), dp(16), dp(4), dp(8));
+        advancedToggle.setOnClickListener(v -> {
+            boolean show = advanced.getVisibility() != View.VISIBLE;
+            advanced.setVisibility(show ? View.VISIBLE : View.GONE);
+            advancedToggle.setText((show ? "\u25BE" : "\u25B8") + "  Advanced options");
+        });
+        root.addView(advancedToggle);
+        advanced = card(root, null, null, null);
+        advanced.addView(label("Downloads page"));
+        pageUrl = edit(prefs.getString("page", DEFAULT_PAGE));
+        advanced.addView(pageUrl);
+        advanced.addView(label("Extra links (one per line, installed after the files above)"));
         manualLinks = edit(prefs.getString("manual", ""));
         manualLinks.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | InputType.TYPE_TEXT_VARIATION_URI);
         manualLinks.setMinLines(2);
         manualLinks.setSingleLine(false);
-        root.addView(manualLinks);
+        advanced.addView(manualLinks);
+        advanced.addView(space(8));
+        advanced.addView(secondaryButton("Add to home screen", v -> addShortcut()));
+        advanced.addView(secondaryButton("Start over (forget finished downloads)", v -> resetProgress()));
+        advanced.setVisibility(View.GONE);
 
-        root.addView(text("\nArchive password (for the resource files):", 14, true));
-        password = edit(prefs.getString("password", DEFAULT_PASSWORD));
-        root.addView(password);
-
-        deleteArchives = new CheckBox(this);
-        deleteArchives.setText("Delete each archive after extracting it (saves a lot of space)");
-        deleteArchives.setChecked(prefs.getBoolean("delete", true));
-        root.addView(deleteArchives);
-
-        startButton = button("3. Download & install everything", v -> start());
-        root.addView(startButton);
-        stopButton = button("Stop", v -> Progress.stopRequested = true);
-        root.addView(stopButton);
-
-        progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progressBar.setMax(1000);
-        root.addView(progressBar);
-        statusText = text("", 14, false);
-        statusText.setTextIsSelectable(true);
-        root.addView(statusText);
-
-        apkButton = button("4. Install the game engine (ONScripter-RU)", v -> installApk());
-        root.addView(apkButton);
-
-        root.addView(button("Start over (forget finished downloads)", v -> resetProgress()));
-
+        // Keep it readable on wide screens (tablets, Odin in landscape).
+        FrameLayout frame = new FrameLayout(this);
+        content = root;
+        frame.addView(root, new FrameLayout.LayoutParams(contentWidth(), ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL));
         ScrollView scroll = new ScrollView(this);
-        scroll.addView(root);
+        scroll.setBackgroundColor(BG);
+        scroll.addView(frame);
         return scroll;
+    }
+
+    private View content;
+
+    private int contentWidth() {
+        return Math.min(getResources().getDisplayMetrics().widthPixels, dp(720));
+    }
+
+    /** Rotation is handled here (see manifest) so the file list isn't lost. */
+    @Override
+    public void onConfigurationChanged(android.content.res.Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        ViewGroup.LayoutParams lp = content.getLayoutParams();
+        lp.width = contentWidth();
+        content.setLayoutParams(lp);
     }
 
     private final Runnable tick = new Runnable() {
@@ -162,13 +260,28 @@ public class MainActivity extends Activity {
         public void run() {
             boolean running = Progress.running;
             startButton.setEnabled(!running);
+            startButton.setAlpha(running ? 0.5f : 1f);
             stopButton.setVisibility(running ? View.VISIBLE : View.GONE);
             statusText.setText(Progress.status);
+            statusText.setVisibility(TextUtils.isEmpty(Progress.status) ? View.GONE : View.VISIBLE);
+
+            int n = Progress.itemCount;
+            boolean showSteps = running && n > 0;
+            stepText.setVisibility(showSteps ? View.VISIBLE : View.GONE);
+            overallBar.setVisibility(showSteps ? View.VISIBLE : View.GONE);
+            if (showSteps) {
+                stepText.setText("File " + (Progress.itemIndex + 1) + " of " + n);
+                overallBar.setProgress(Progress.itemIndex * 1000 / n);
+            }
             int p = Progress.stepPermille;
             progressBar.setIndeterminate(running && p < 0);
             if (p >= 0) progressBar.setProgress(p);
             progressBar.setVisibility(running || p >= 0 ? View.VISIBLE : View.GONE);
-            apkButton.setVisibility(Progress.apkPath != null && !running ? View.VISIBLE : View.GONE);
+
+            boolean apk = Progress.apkPath != null && !running;
+            apkButton.setEnabled(apk);
+            apkButton.setAlpha(apk ? 1f : 0.4f);
+            apkButton.setText(apk ? "Install ONScripter-RU" : "Install ONScripter-RU (after download)");
             updateSpace();
             handler.postDelayed(this, 500);
         }
@@ -181,8 +294,8 @@ public class MainActivity extends Activity {
             if (dir == null) return;
             long free = new StatFs(dir.getAbsolutePath()).getAvailableBytes();
             spaceText.setText(String.format(Locale.ROOT,
-                    "Free space: %.1f GB (while unpacking the resources you need room for both the parts and the "
-                            + "unpacked game, about 20+ GB)", free / 1e9));
+                    "Free space: %.1f GB  \u2022  about 20 GB is needed while unpacking", free / 1e9));
+            spaceText.setTextColor(free < 20e9 ? 0xFFE08A8A : MUTED);
         } catch (IllegalArgumentException ignored) {
             spaceText.setText("");
         }
@@ -197,8 +310,9 @@ public class MainActivity extends Activity {
 
     private void refreshPermission() {
         boolean ok = hasStorage();
-        permissionButton.setText(ok ? "1. File access allowed ✓" : "1. Allow access to files");
+        permissionButton.setText(ok ? "File access allowed  \u2713" : "Allow access");
         permissionButton.setEnabled(!ok);
+        styleFilled(permissionButton, ok ? 0xFF2E4A36 : GOLD, ok ? OK : BG);
     }
 
     private void askStoragePermission() {
@@ -221,39 +335,68 @@ public class MainActivity extends Activity {
 
     private void findFiles() {
         String url = pageUrl.getText().toString().trim();
-        itemHeader.setText("\nLooking for files...");
+        itemHeader.setText("Looking for files...");
         itemList.removeAllViews();
+        selectRow.setVisibility(View.GONE);
+        findButton.setEnabled(false);
         new Thread(() -> {
             try {
                 List<Item> found = LinkScraper.scrape(url);
                 runOnUiThread(() -> showItems(found));
             } catch (Exception e) {
-                runOnUiThread(() -> itemHeader.setText("\nCould not read the page: " + e.getMessage()
-                        + "\nCheck your internet, or paste the links into \"Extra links\" below."));
+                runOnUiThread(() -> itemHeader.setText("Could not read the page: " + e.getMessage()
+                        + "\nCheck your internet, or paste links under Advanced options."));
+            } finally {
+                runOnUiThread(() -> findButton.setEnabled(true));
             }
         }).start();
     }
+
+    private final List<CheckBox> boxes = new ArrayList<>();
 
     private void showItems(List<Item> found) {
         items.clear();
         items.addAll(found);
         itemList.removeAllViews();
+        boxes.clear();
         if (found.isEmpty()) {
-            itemHeader.setText("\nNo download links found on that page. "
-                    + "Paste the links into \"Extra links\" below instead.");
+            itemHeader.setText("No download links found on that page. "
+                    + "Paste the links under Advanced options instead.");
             return;
         }
-        itemHeader.setText("\nFound " + found.size() + " files. They are installed top to bottom "
-                + "(later ones overwrite earlier ones). Untick anything you don't want, e.g. other "
-                + "language packs or engines for other systems:");
+        itemHeader.setText("Found " + found.size() + " files. They are installed top to bottom; "
+                + "untick anything you don't need.");
+        selectRow.setVisibility(View.VISIBLE);
+        String section = null;
         for (Item it : found) {
+            int dash = it.label.indexOf(" - ");
+            String sec = dash > 0 ? it.label.substring(0, dash) : "";
+            String name = dash > 0 ? it.label.substring(dash + 3) : it.label;
+            if (!sec.equals(section)) {
+                section = sec;
+                if (!sec.isEmpty()) {
+                    TextView h = text(sec.toUpperCase(Locale.ROOT), 12, GOLD);
+                    h.setTypeface(Typeface.DEFAULT_BOLD);
+                    h.setLetterSpacing(0.08f);
+                    h.setPadding(0, dp(14), 0, dp(2));
+                    itemList.addView(h);
+                }
+            }
             CheckBox cb = new CheckBox(this);
-            cb.setText(it.label);
+            cb.setText(name);
+            cb.setTextColor(it.supported ? TEXT : MUTED);
+            cb.setTextSize(14);
+            cb.setPadding(dp(4), dp(6), 0, dp(6));
             cb.setChecked(it.selected);
             cb.setEnabled(it.supported);
             cb.setOnCheckedChangeListener((b, checked) -> it.selected = checked);
+            if (it.supported) boxes.add(cb);
             itemList.addView(cb);
         }
+    }
+
+    private void selectAll(boolean on) {
+        for (CheckBox cb : boxes) cb.setChecked(on);
     }
 
     private void start() {
@@ -334,13 +477,93 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    // ---------------------------------------------------------------- home screen shortcut
+
+    /** Some launchers (e.g. on handhelds) don't show new apps on the home screen; offer it once. */
+    private void offerShortcutOnce() {
+        if (prefs.getBoolean("shortcut_offered", false)) return;
+        ShortcutManager sm = getSystemService(ShortcutManager.class);
+        if (sm == null || !sm.isRequestPinShortcutSupported()) return;
+        prefs.edit().putBoolean("shortcut_offered", true).apply();
+        new AlertDialog.Builder(this)
+                .setTitle("Add to home screen?")
+                .setMessage("Put an Umineko Installer icon on your home screen so it's easy to find later.")
+                .setPositiveButton("Add", (d, w) -> addShortcut())
+                .setNegativeButton("No thanks", null)
+                .show();
+    }
+
+    private void addShortcut() {
+        ShortcutManager sm = getSystemService(ShortcutManager.class);
+        if (sm == null || !sm.isRequestPinShortcutSupported()) {
+            Toast.makeText(this, "Your launcher doesn't allow adding shortcuts. "
+                    + "Look for Umineko Installer in the app list.", Toast.LENGTH_LONG).show();
+            return;
+        }
+        ShortcutInfo info = new ShortcutInfo.Builder(this, "open")
+                .setShortLabel(getString(R.string.app_name))
+                .setIcon(Icon.createWithResource(this, R.mipmap.ic_launcher))
+                .setIntent(new Intent(Intent.ACTION_MAIN)
+                        .setClass(this, MainActivity.class)
+                        .addCategory(Intent.CATEGORY_LAUNCHER))
+                .build();
+        sm.requestPinShortcut(info, null);
+    }
+
     // ---------------------------------------------------------------- view helpers
 
-    private TextView text(String s, int sp, boolean bold) {
+    /** A rounded card with an optional numbered title; returns the container to add content to. */
+    private LinearLayout card(LinearLayout parent, String number, String title, String subtitle) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(16), dp(16), dp(16), dp(16));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(CARD);
+        bg.setCornerRadius(dp(16));
+        bg.setStroke(dp(1), CARD_BORDER);
+        card.setBackground(bg);
+
+        if (title != null) {
+            LinearLayout head = new LinearLayout(this);
+            head.setGravity(Gravity.CENTER_VERTICAL);
+            TextView num = text(number, 14, BG);
+            num.setTypeface(Typeface.DEFAULT_BOLD);
+            num.setGravity(Gravity.CENTER);
+            GradientDrawable circle = new GradientDrawable();
+            circle.setShape(GradientDrawable.OVAL);
+            circle.setColor(GOLD);
+            num.setBackground(circle);
+            head.addView(num, new LinearLayout.LayoutParams(dp(28), dp(28)));
+            TextView t = text(title, 18, TEXT);
+            t.setTypeface(Typeface.DEFAULT_BOLD);
+            t.setPadding(dp(12), 0, 0, 0);
+            head.addView(t);
+            card.addView(head);
+            if (subtitle != null) {
+                TextView sub = text(subtitle, 13, MUTED);
+                sub.setPadding(0, dp(6), 0, dp(10));
+                card.addView(sub);
+            }
+        }
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.bottomMargin = dp(12);
+        parent.addView(card, lp);
+        return card;
+    }
+
+    private TextView text(String s, int sp, int color) {
         TextView t = new TextView(this);
         t.setText(s);
         t.setTextSize(sp);
-        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextColor(color);
+        return t;
+    }
+
+    private TextView label(String s) {
+        TextView t = text(s, 12, MUTED);
+        t.setPadding(dp(4), dp(8), 0, 0);
         return t;
     }
 
@@ -348,14 +571,77 @@ public class MainActivity extends Activity {
         EditText e = new EditText(this);
         e.setText(value);
         e.setSingleLine(true);
+        e.setTextColor(TEXT);
+        e.setTextSize(14);
+        e.setBackgroundTintList(ColorStateList.valueOf(CARD_BORDER));
         return e;
     }
 
-    private Button button(String label, View.OnClickListener l) {
+    private ProgressBar bar() {
+        ProgressBar b = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        b.setMax(1000);
+        b.setProgressTintList(ColorStateList.valueOf(GOLD));
+        b.setIndeterminateTintList(ColorStateList.valueOf(GOLD));
+        b.setProgressBackgroundTintList(ColorStateList.valueOf(CARD_BORDER));
+        return b;
+    }
+
+    private Button primaryButton(String label, View.OnClickListener l) {
+        Button b = baseButton(label, l);
+        styleFilled(b, GOLD, BG);
+        return b;
+    }
+
+    private Button secondaryButton(String label, View.OnClickListener l) {
+        Button b = baseButton(label, l);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), CRIMSON);
+        bg.setColor(Color.TRANSPARENT);
+        b.setBackground(bg);
+        b.setTextColor(0xFFE6A0AE);
+        return b;
+    }
+
+    private Button linkButton(String label, View.OnClickListener l) {
+        Button b = baseButton(label, l);
+        b.setBackground(null);
+        b.setTextColor(GOLD);
+        b.setTextSize(13);
+        b.setMinHeight(0);
+        b.setPadding(dp(4), dp(4), dp(16), dp(4));
+        b.setLayoutParams(new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return b;
+    }
+
+    private Button baseButton(String label, View.OnClickListener l) {
         Button b = new Button(this);
         b.setText(label);
+        b.setAllCaps(false);
+        b.setTextSize(15);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setStateListAnimator(null);
         b.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
+        lp.topMargin = dp(6);
+        b.setLayoutParams(lp);
         return b;
+    }
+
+    private void styleFilled(Button b, int fill, int textColor) {
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(12));
+        bg.setColor(fill);
+        b.setBackground(bg);
+        b.setTextColor(textColor);
+    }
+
+    private View space(int heightDp) {
+        View v = new View(this);
+        v.setLayoutParams(new LinearLayout.LayoutParams(1, dp(heightDp)));
+        return v;
     }
 
     private int dp(int v) {
