@@ -1,0 +1,46 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Build
+        run: gradle --no-daemon assembleRelease
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/release/app-release.apk UminekoInstaller.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UminekoInstaller
+          path: UminekoInstaller.apk
+
+      - name: Publish as a download on the Releases page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          tag="build-${BRANCH//\//-}"
+          gh release delete "$tag" --yes --cleanup-tag || true
+          gh release create "$tag" UminekoInstaller.apk \
+            --target "$GITHUB_SHA" \
+            --title "Umineko Installer (latest build of $BRANCH)" \
+            --notes "Open this page on your phone and tap UminekoInstaller.apk to download it."
