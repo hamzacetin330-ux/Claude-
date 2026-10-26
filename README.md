@@ -10,7 +10,9 @@ It does what you would otherwise do by hand:
 2. It downloads each file. It uses the Yandex Disk mirror or a direct link. Mega isn't supported, but you can
    paste other links yourself.
 3. It extracts each archive (`.zip` / `.7z`) into one game folder. Later files overwrite earlier ones,
-   just as the instructions say. You can delete each archive right after extracting it to save space.
+   just as the instructions say. The resource files (`.001` to `.012`) are parts of one password-protected
+   archive. The app waits until all of them are downloaded, then unpacks them together with the password
+   (already filled in). You can delete each archive right after extracting it to save space.
 4. It offers to install the downloaded ONScripter-RU engine APK.
 
 The download runs in the background with a notification. If it stops (no internet, phone restarted), press the button

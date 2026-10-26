@@ -37,6 +37,8 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_PAGE = "https://umineko-project.org/en/downloads/";
+    /** Password of the split resource archive (resources .001 - .012). */
+    private static final String DEFAULT_PASSWORD = "035646750436634546568555050";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<Item> items = new ArrayList<>();
@@ -45,6 +47,7 @@ public class MainActivity extends Activity {
     private EditText pageUrl;
     private EditText targetDir;
     private EditText manualLinks;
+    private EditText password;
     private CheckBox deleteArchives;
     private LinearLayout itemList;
     private TextView itemHeader;
@@ -123,6 +126,10 @@ public class MainActivity extends Activity {
         manualLinks.setSingleLine(false);
         root.addView(manualLinks);
 
+        root.addView(text("\nArchive password (for the resource files):", 14, true));
+        password = edit(prefs.getString("password", DEFAULT_PASSWORD));
+        root.addView(password);
+
         deleteArchives = new CheckBox(this);
         deleteArchives.setText("Delete each archive after extracting it (saves a lot of space)");
         deleteArchives.setChecked(prefs.getBoolean("delete", true));
@@ -174,7 +181,8 @@ public class MainActivity extends Activity {
             if (dir == null) return;
             long free = new StatFs(dir.getAbsolutePath()).getAvailableBytes();
             spaceText.setText(String.format(Locale.ROOT,
-                    "Free space: %.1f GB (the full game needs well over 10 GB while installing)", free / 1e9));
+                    "Free space: %.1f GB (while unpacking the resources you need room for both the parts and the "
+                            + "unpacked game, about 20+ GB)", free / 1e9));
         } catch (IllegalArgumentException ignored) {
             spaceText.setText("");
         }
@@ -270,6 +278,7 @@ public class MainActivity extends Activity {
                 .putString("page", pageUrl.getText().toString().trim())
                 .putString("manual", manualLinks.getText().toString())
                 .putBoolean("delete", deleteArchives.isChecked())
+                .putString("password", password.getText().toString().trim())
                 .apply();
 
         StringBuilder list = new StringBuilder();
@@ -283,7 +292,8 @@ public class MainActivity extends Activity {
                     Intent i = new Intent(this, InstallService.class)
                             .putExtra(InstallService.EXTRA_ITEMS, Item.toJson(chosen))
                             .putExtra(InstallService.EXTRA_TARGET, target)
-                            .putExtra(InstallService.EXTRA_DELETE_ARCHIVES, deleteArchives.isChecked());
+                            .putExtra(InstallService.EXTRA_DELETE_ARCHIVES, deleteArchives.isChecked())
+                            .putExtra(InstallService.EXTRA_PASSWORD, password.getText().toString().trim());
                     startForegroundService(i);
                 })
                 .setNegativeButton("Cancel", null)

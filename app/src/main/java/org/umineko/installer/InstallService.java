@@ -13,10 +13,12 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 
+import org.apache.commons.compress.PasswordRequiredException;
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZFile;
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry;
 import org.apache.commons.compress.archivers.zip.ZipFile;
+import org.apache.commons.compress.utils.MultiReadOnlySeekableByteChannel;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -29,7 +31,12 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.List;
@@ -48,6 +55,7 @@ public class InstallService extends Service {
     public static final String EXTRA_ITEMS = "items";
     public static final String EXTRA_TARGET = "target";
     public static final String EXTRA_DELETE_ARCHIVES = "delete_archives";
+    public static final String EXTRA_PASSWORD = "password";
 
     static final String PREFS = "install";
     private static final String CHANNEL = "install";
@@ -80,6 +88,7 @@ public class InstallService extends Service {
         List<Item> items = Item.fromJson(intent.getStringExtra(EXTRA_ITEMS));
         File target = new File(intent.getStringExtra(EXTRA_TARGET));
         boolean deleteArchives = intent.getBooleanExtra(EXTRA_DELETE_ARCHIVES, true);
+        String password = intent.getStringExtra(EXTRA_PASSWORD);
 
         PowerManager pm = getSystemService(PowerManager.class);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UminekoInstaller:install");
@@ -91,7 +100,7 @@ public class InstallService extends Service {
         Progress.itemCount = items.size();
         new Thread(() -> {
             try {
-                runAll(items, target, deleteArchives);
+                runAll(items, target, deleteArchives, password);
                 if (Progress.stopRequested) {
                     setStatus("Stopped. Press the button again to continue where it left off.", -1);
                 } else {
@@ -112,7 +121,8 @@ public class InstallService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void runAll(List<Item> items, File target, boolean deleteArchives) throws Exception {
+    private void runAll(List<Item> items, File target, boolean deleteArchives, String password)
+            throws Exception {
         if (!target.isDirectory() && !target.mkdirs()) {
             throw new IOException("Cannot create folder " + target
                     + ". Did you allow \"All files access\"?");
@@ -123,6 +133,10 @@ public class InstallService extends Service {
         }
         SharedPreferences prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         Set<String> done = new HashSet<>(prefs.getStringSet("done", new HashSet<>()));
+
+        // Parts of a split archive (name.7z.001, name.7z.002, ...) are only extracted once
+        // the whole set is downloaded, before anything that comes after them on the page.
+        Volumes pending = null;
 
         for (int i = 0; i < items.size(); i++) {
             if (Progress.stopRequested) return;
@@ -135,6 +149,18 @@ public class InstallService extends Service {
             File file = download(item, downloads, i, prefix);
             if (file == null) return; // stopped
 
+            String base = volumeBase(file);
+            if (pending != null && !pending.base.equals(base)) {
+                if (!finishVolumes(pending, target, deleteArchives, password, done, prefs)) return;
+                pending = null;
+            }
+            if (base != null) {
+                if (pending == null) pending = new Volumes(base);
+                pending.parts.add(file);
+                pending.keys.add(key);
+                continue;
+            }
+
             String name = file.getName().toLowerCase(Locale.ROOT);
             if (name.endsWith(".apk")) {
                 File apk = new File(target, file.getName());
@@ -142,18 +168,66 @@ public class InstallService extends Service {
                 Progress.apkPath = apk.getAbsolutePath();
                 prefs.edit().putString("apk", Progress.apkPath).apply();
             } else {
-                setStatus(prefix + "Extracting " + item.label, -1);
-                extract(file, target, prefix + "Extracting " + item.label);
+                String status = prefix + "Extracting " + item.label;
+                setStatus(status, -1);
+                extract(Collections.singletonList(file), target, password, status);
                 if (Progress.stopRequested) return;
                 if (deleteArchives) file.delete();
             }
             done.add(key);
             prefs.edit().putStringSet("done", new HashSet<>(done)).apply();
         }
+        if (pending != null && !finishVolumes(pending, target, deleteArchives, password, done, prefs)) return;
         if (deleteArchives) {
             File[] left = downloads.listFiles();
             if (left == null || left.length == 0) downloads.delete();
         }
+    }
+
+    private static final class Volumes {
+        final String base;
+        final List<File> parts = new ArrayList<>();
+        final List<String> keys = new ArrayList<>();
+
+        Volumes(String base) {
+            this.base = base;
+        }
+    }
+
+    private static final Pattern VOLUME = Pattern.compile("^(?:\\d\\d-)?(.+)\\.(\\d{3})$");
+
+    /** "03-umineko.7z.002" -> "umineko.7z"; null if the file is not part of a split archive. */
+    private static String volumeBase(File f) {
+        Matcher m = VOLUME.matcher(f.getName());
+        return m.matches() ? m.group(1).toLowerCase(Locale.ROOT) : null;
+    }
+
+    /** Extracts a complete split archive; returns false if the user pressed Stop. */
+    private boolean finishVolumes(Volumes v, File target, boolean deleteArchives, String password,
+                                  Set<String> done, SharedPreferences prefs) throws IOException {
+        v.parts.sort((a, b) -> {
+            Matcher ma = VOLUME.matcher(a.getName());
+            Matcher mb = VOLUME.matcher(b.getName());
+            ma.matches();
+            mb.matches();
+            return Integer.compare(Integer.parseInt(ma.group(2)), Integer.parseInt(mb.group(2)));
+        });
+        for (int n = 0; n < v.parts.size(); n++) {
+            Matcher m = VOLUME.matcher(v.parts.get(n).getName());
+            m.matches();
+            if (Integer.parseInt(m.group(2)) != n + 1) {
+                throw new IOException("Part ." + String.format(Locale.ROOT, "%03d", n + 1) + " of " + v.base
+                        + " is missing. Make sure every resource file is ticked.");
+            }
+        }
+        String status = "Extracting " + v.base + " (" + v.parts.size() + " parts)";
+        setStatus(status, -1);
+        extract(v.parts, target, password, status);
+        if (Progress.stopRequested) return false;
+        if (deleteArchives) for (File f : v.parts) f.delete();
+        done.addAll(v.keys);
+        prefs.edit().putStringSet("done", new HashSet<>(done)).apply();
+        return true;
     }
 
     // ---------------------------------------------------------------- downloading
@@ -312,28 +386,38 @@ public class InstallService extends Service {
 
     // ---------------------------------------------------------------- extracting
 
-    private void extract(File archive, File target, String status) throws IOException {
+    private void extract(List<File> parts, File target, String password, String status) throws IOException {
+        File first = parts.get(0);
         byte[] magic = new byte[6];
-        try (InputStream in = new java.io.FileInputStream(archive)) {
-            if (in.read(magic) < 4) throw new IOException(archive.getName() + " is too small");
+        try (InputStream in = new java.io.FileInputStream(first)) {
+            if (in.read(magic) < 4) throw new IOException(first.getName() + " is too small");
         }
         if (magic[0] == 'P' && magic[1] == 'K') {
-            extractZip(archive, target, status);
+            extractZip(parts, target, status);
         } else if ((magic[0] & 0xff) == 0x37 && (magic[1] & 0xff) == 0x7A && (magic[2] & 0xff) == 0xBC) {
-            extract7z(archive, target, status);
+            extract7z(parts, target, password, status);
         } else if (magic[0] == 'R' && magic[1] == 'a' && magic[2] == 'r') {
-            throw new IOException(archive.getName() + " is a RAR archive, which this app cannot open yet");
-        } else {
+            throw new IOException(first.getName() + " is a RAR archive, which this app cannot open yet");
+        } else if (parts.size() == 1) {
             // Not an archive: just place the file in the game folder.
-            String name = archive.getName().replaceFirst("^\\d\\d-", "");
+            String name = first.getName().replaceFirst("^\\d\\d-", "");
             File dest = new File(target, name);
             dest.delete();
-            if (!archive.renameTo(dest)) throw new IOException("Cannot move " + archive.getName());
+            if (!first.renameTo(dest)) throw new IOException("Cannot move " + first.getName());
+        } else {
+            throw new IOException(first.getName() + " is not a 7z or zip archive");
         }
     }
 
-    private void extractZip(File archive, File target, String status) throws IOException {
-        try (ZipFile zip = ZipFile.builder().setFile(archive).get()) {
+    /** All parts of a split archive read as one continuous file, without joining them on disk. */
+    private static SeekableByteChannel channel(List<File> parts) throws IOException {
+        return parts.size() == 1
+                ? Files.newByteChannel(parts.get(0).toPath(), StandardOpenOption.READ)
+                : MultiReadOnlySeekableByteChannel.forFiles(parts.toArray(new File[0]));
+    }
+
+    private void extractZip(List<File> parts, File target, String status) throws IOException {
+        try (ZipFile zip = ZipFile.builder().setSeekableByteChannel(channel(parts)).get()) {
             long total = 0;
             for (Enumeration<ZipArchiveEntry> e = zip.getEntries(); e.hasMoreElements(); ) {
                 total += Math.max(0, e.nextElement().getSize());
@@ -347,6 +431,10 @@ public class InstallService extends Service {
                     out.mkdirs();
                     continue;
                 }
+                if (!zip.canReadEntryData(entry)) {
+                    throw new IOException(entry.getName() + " is password protected or uses an "
+                            + "unsupported zip method; this app can only open passwords on 7z archives");
+                }
                 try (InputStream in = zip.getInputStream(entry)) {
                     done = writeEntry(in, out, done, total, status);
                 }
@@ -354,8 +442,20 @@ public class InstallService extends Service {
         }
     }
 
-    private void extract7z(File archive, File target, String status) throws IOException {
-        try (SevenZFile sz = SevenZFile.builder().setFile(archive).get()) {
+    private void extract7z(List<File> parts, File target, String password, String status) throws IOException {
+        SevenZFile.Builder builder = SevenZFile.builder().setSeekableByteChannel(channel(parts));
+        if (password != null && !password.isEmpty()) builder.setPassword(password.toCharArray());
+        SevenZFile sz;
+        try {
+            sz = builder.get();
+        } catch (PasswordRequiredException e) {
+            throw new IOException("The archive needs a password. Type it into the password box.", e);
+        } catch (IOException e) {
+            if (password == null || password.isEmpty()) throw e;
+            throw new IOException("Could not open the archive - the password is probably wrong, "
+                    + "or a part is damaged. (" + e.getMessage() + ")", e);
+        }
+        try (SevenZFile ignored = sz) {
             long total = 0;
             for (SevenZArchiveEntry e : sz.getEntries()) total += Math.max(0, e.getSize());
             long done = 0;
@@ -373,6 +473,14 @@ public class InstallService extends Service {
                 }
                 done = writeEntry(sz.getInputStream(entry), out, done, total, status);
             }
+        } catch (PasswordRequiredException e) {
+            throw new IOException("The archive needs a password. Type it into the password box.", e);
+        } catch (IOException e) {
+            if (password != null && !password.isEmpty() && String.valueOf(e.getMessage()).contains("Checksum")) {
+                throw new IOException("Could not unpack the archive - the password may be wrong, "
+                        + "or a part is damaged. (" + e.getMessage() + ")", e);
+            }
+            throw e;
         }
     }
 
