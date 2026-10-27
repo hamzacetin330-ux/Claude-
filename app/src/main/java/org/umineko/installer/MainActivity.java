@@ -313,10 +313,18 @@ public class MainActivity extends Activity {
             if (p >= 0) progressBar.setProgress(p);
             progressBar.setVisibility(running || p >= 0 ? View.VISIBLE : View.GONE);
 
-            boolean apk = Progress.apkPath != null && !running;
-            apkButton.setEnabled(apk);
-            apkButton.setAlpha(apk ? 1f : 0.4f);
-            apkButton.setText(apk ? "Install ONScripter-RU" : "Install ONScripter-RU (after download)");
+            if (running) {
+                apkScanned = false;
+            } else if (Progress.apkPath == null && !apkScanned) {
+                apkScanned = true;
+                File found = findApk(new File(targetDir.getText().toString().trim()));
+                if (found != null) Progress.apkPath = found.getAbsolutePath();
+            }
+            boolean apk = Progress.apkPath != null && new File(Progress.apkPath).exists();
+            apkButton.setEnabled(!running);
+            apkButton.setAlpha(running ? 0.4f : 1f);
+            apkButton.setText(running ? "Install ONScripter-RU (after download)"
+                    : apk ? "Install ONScripter-RU" : "Choose the ONScripter-RU APK file...");
             updateSpace();
             handler.postDelayed(this, 500);
         }
@@ -485,12 +493,46 @@ public class MainActivity extends Activity {
                 .show();
     }
 
-    private void installApk() {
-        File apk = new File(Progress.apkPath);
-        if (!apk.exists()) {
-            Toast.makeText(this, "The engine APK is missing: " + apk, Toast.LENGTH_LONG).show();
-            return;
+    private boolean apkScanned;
+    private static final int PICK_APK = 7;
+
+    /**
+     * Looks for an engine APK in the game folder (and two levels below), e.g. one that came
+     * inside a zip and was extracted with the game files. Newest wins.
+     */
+    private static File findApk(File dir) {
+        File best = null;
+        java.util.ArrayDeque<File[]> todo = new java.util.ArrayDeque<>();
+        todo.add(new File[]{dir});
+        for (int depth = 0; depth < 3 && !todo.isEmpty(); depth++) {
+            java.util.ArrayDeque<File[]> next = new java.util.ArrayDeque<>();
+            for (File[] level : todo) {
+                for (File d : level) {
+                    File[] files = d.listFiles();
+                    if (files == null) continue;
+                    List<File> subdirs = new ArrayList<>();
+                    for (File f : files) {
+                        if (f.isDirectory()) {
+                            // The game's own folders hold tens of thousands of files; skip them.
+                            String n = f.getName().toLowerCase(Locale.ROOT);
+                            if (!n.equals("sound") && !n.equals("voice") && !n.equals("bgm") && !n.equals("se")
+                                    && !n.equals("graphics") && !n.equals("video")) {
+                                subdirs.add(f);
+                            }
+                        } else if (f.getName().toLowerCase(Locale.ROOT).endsWith(".apk")
+                                && (best == null || f.lastModified() > best.lastModified())) {
+                            best = f;
+                        }
+                    }
+                    next.add(subdirs.toArray(new File[0]));
+                }
+            }
+            todo = next;
         }
+        return best;
+    }
+
+    private void installApk() {
         if (!getPackageManager().canRequestPackageInstalls()) {
             Toast.makeText(this, "Allow \"Install unknown apps\" for this app, then press the button again",
                     Toast.LENGTH_LONG).show();
@@ -498,9 +540,30 @@ public class MainActivity extends Activity {
                     Uri.parse("package:" + getPackageName())));
             return;
         }
+        File apk = Progress.apkPath != null ? new File(Progress.apkPath) : null;
+        if (apk == null || !apk.exists()) {
+            // No engine was downloaded (or it wasn't found): let the user pick the APK file.
+            Toast.makeText(this, "Pick the ONScripter-RU .apk file", Toast.LENGTH_SHORT).show();
+            Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                    .addCategory(Intent.CATEGORY_OPENABLE)
+                    .setType("*/*")
+                    .putExtra(Intent.EXTRA_MIME_TYPES, new String[]{
+                            "application/vnd.android.package-archive", "application/octet-stream"});
+            startActivityForResult(pick, PICK_APK);
+            return;
+        }
         Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", apk);
         startActivity(new Intent(Intent.ACTION_VIEW)
                 .setDataAndType(uri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK));
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != PICK_APK || resultCode != RESULT_OK || data == null || data.getData() == null) return;
+        startActivity(new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(data.getData(), "application/vnd.android.package-archive")
                 .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK));
     }
 
