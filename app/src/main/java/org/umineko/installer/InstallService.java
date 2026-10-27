@@ -109,6 +109,7 @@ public class InstallService extends Service {
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UminekoInstaller:install");
         wakeLock.acquire();
 
+        skippedFiles.clear();
         Progress.running = true;
         Progress.stopRequested = false;
         Progress.error = null;
@@ -119,7 +120,13 @@ public class InstallService extends Service {
                 if (Progress.stopRequested) {
                     setStatus("Stopped. Press the button again to continue where it left off.", -1);
                 } else {
-                    setStatus("All done! The game files are in " + target.getAbsolutePath(), 1000);
+                    String note = "";
+                    if (!skippedFiles.isEmpty()) {
+                        note = "\n\nNote: " + skippedFiles.size() + " file(s) could not be written because "
+                                + "Android refused them (the game should still work):\n"
+                                + String.join("\n", skippedFiles.subList(0, Math.min(10, skippedFiles.size())));
+                    }
+                    setStatus("All done! The game files are in " + target.getAbsolutePath() + note, 1000);
                 }
             } catch (Exception e) {
                 Progress.error = e.toString();
@@ -907,7 +914,12 @@ public class InstallService extends Service {
                     throw new IOException("Cannot create " + parent);
                 }
                 currentEntry = out.getName();
-                try (OutputStream os = new FileOutputStream(out)) {
+                if (alreadyExtracted(out, entry)) {
+                    done.addAndGet(entry.getSize());
+                    continue;
+                }
+                try (OutputStream os = openOutput(out, entry.getName())) {
+                    if (os == null) continue; // refused by the system; listed at the end
                     // Empty files and directories never touch the decoder (that would make it
                     // restart the current block).
                     if (!entry.hasStream() || entry.getSize() == 0) continue;
@@ -924,6 +936,24 @@ public class InstallService extends Service {
                 }
             }
         }
+    }
+
+    /**
+     * True if a previous (interrupted) run already wrote this file completely: same size and,
+     * when the archive has one, the same CRC. Lets a retry continue instead of starting over.
+     */
+    private static boolean alreadyExtracted(File out, SevenZArchiveEntry entry) {
+        if (!entry.hasStream() || entry.getSize() <= 0 || !entry.getHasCrc()) return false;
+        if (!out.isFile() || out.length() != entry.getSize()) return false;
+        java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+        byte[] buf = new byte[BUFFER];
+        try (InputStream in = new java.io.FileInputStream(out)) {
+            int r;
+            while ((r = in.read(buf)) > 0) crc.update(buf, 0, r);
+        } catch (IOException e) {
+            return false;
+        }
+        return crc.getValue() == entry.getCrcValue();
     }
 
     /** "42% · 35.0 MB/s · about 6 min left · ", or "" while there isn't enough data yet. */
@@ -944,7 +974,8 @@ public class InstallService extends Service {
         }
         byte[] buf = new byte[BUFFER];
         long lastUpdate = 0;
-        try (OutputStream os = new FileOutputStream(out)) {
+        try (OutputStream os = openOutput(out, out.getName())) {
+            if (os == null) return done;
             int r;
             while ((r = in.read(buf)) > 0) {
                 os.write(buf, 0, r);
@@ -974,12 +1005,50 @@ public class InstallService extends Service {
 
     /** Refuses archive entries that try to escape the game folder ("../"). */
     private static File safeFile(File root, String entryName) throws IOException {
-        File f = new File(root, entryName);
+        File f = new File(root, cleanPath(entryName));
         String rootPath = root.getCanonicalPath() + File.separator;
         if (!f.getCanonicalPath().startsWith(rootPath)) {
             throw new IOException("Bad path in archive: " + entryName);
         }
         return f;
+    }
+
+    /**
+     * Replaces characters Android's shared storage refuses in file names (control characters,
+     * " * : < > ? \\ |, and broken UTF-16 that would turn into '?') with '_'.
+     */
+    static String cleanPath(String name) {
+        StringBuilder sb = new StringBuilder(name.length());
+        for (int i = 0; i < name.length(); i++) {
+            char c = name.charAt(i);
+            if (c == '\\') c = '/';
+            if (Character.isHighSurrogate(c) && i + 1 < name.length() && Character.isLowSurrogate(name.charAt(i + 1))) {
+                sb.append(c).append(name.charAt(++i));
+                continue;
+            }
+            boolean bad = c < 0x20 || c == 0x7f || "\"*:<>?|".indexOf(c) >= 0 || Character.isSurrogate(c)
+                    || c == '\uFFFD';
+            sb.append(bad ? '_' : c);
+        }
+        return sb.toString();
+    }
+
+    /** Files that couldn't be written (e.g. the system refused the name); shown at the end. */
+    private final List<String> skippedFiles = Collections.synchronizedList(new ArrayList<>());
+
+    /**
+     * Opens a file for writing, or returns null (and remembers it) if Android refuses that one
+     * file. A full disk still fails the whole install.
+     */
+    private OutputStream openOutput(File out, String entryName) throws IOException {
+        try {
+            return new FileOutputStream(out);
+        } catch (java.io.FileNotFoundException e) {
+            String m = String.valueOf(e.getMessage());
+            if (m.contains("ENOSPC")) throw e;
+            skippedFiles.add(entryName + " (" + m.replaceAll(".*: open failed: ", "") + ")");
+            return null;
+        }
     }
 
     // ---------------------------------------------------------------- helpers
