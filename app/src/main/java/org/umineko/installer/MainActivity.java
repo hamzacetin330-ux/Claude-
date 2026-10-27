@@ -50,6 +50,8 @@ import java.util.Locale;
 public class MainActivity extends Activity {
 
     private static final String DEFAULT_PAGE = "https://umineko-project.org/en/downloads/";
+    /** ONScripter-NEW: a maintained ONScripter-RU fork with a 64-bit Android build. */
+    private static final String ONS_NEW = "https://github.com/timftw21/onscripter-new/releases/latest/download/";
     /** Password of the split resource archive (resources .001 - .012). */
     private static final String DEFAULT_PASSWORD = "035646750436634546568555050";
 
@@ -62,6 +64,7 @@ public class MainActivity extends Activity {
     private EditText manualLinks;
     private EditText password;
     private CheckBox deleteArchives;
+    private CheckBox useOnsNew;
     private RadioGroup coresGroup;
     /** Choices for "Unpacking speed": label and number of cores (0 = auto). */
     private static final String[] CORE_LABELS = {"Auto", "1", "2", "4"};
@@ -180,6 +183,20 @@ public class MainActivity extends Activity {
         c3.addView(label("Archive password"));
         password = edit(prefs.getString("password", DEFAULT_PASSWORD));
         c3.addView(password);
+        c3.addView(label("Game engine"));
+        // Phones with only 64-bit CPUs (e.g. Snapdragon 8 Elite) can't run the old 32-bit engine.
+        boolean only64 = Build.SUPPORTED_32_BIT_ABIS.length == 0;
+        useOnsNew = new CheckBox(this);
+        useOnsNew.setText("Use ONScripter-NEW (64-bit engine)");
+        useOnsNew.setTextColor(TEXT);
+        useOnsNew.setChecked(prefs.getBoolean("onsnew", only64));
+        c3.addView(useOnsNew);
+        c3.addView(text((only64 ? "Recommended: this device can't run 32-bit apps, so the original "
+                + "ONScripter-RU engine shows \"not compatible\". " : "")
+                + "ONScripter-NEW is a maintained fork of ONScripter-RU made for Umineko Project. "
+                + "Its engine and shared files are downloaded from its GitHub release and installed last.",
+                12, MUTED));
+
         deleteArchives = new CheckBox(this);
         deleteArchives.setText("Delete archives after extracting (saves space)");
         deleteArchives.setTextColor(TEXT);
@@ -231,8 +248,8 @@ public class MainActivity extends Activity {
 
         // 4. Engine
         LinearLayout c4 = card(root, "4", "Install the game engine",
-                "When the download is finished, install ONScripter-RU and start the game from it.");
-        apkButton = primaryButton("Install ONScripter-RU", v -> installApk());
+                "When everything is installed, install the engine, open it and choose the game folder.");
+        apkButton = primaryButton("Install the game engine", v -> installApk());
         c4.addView(apkButton);
 
         // Advanced (collapsed)
@@ -323,8 +340,9 @@ public class MainActivity extends Activity {
             boolean apk = Progress.apkPath != null && new File(Progress.apkPath).exists();
             apkButton.setEnabled(!running);
             apkButton.setAlpha(running ? 0.4f : 1f);
-            apkButton.setText(running ? "Install ONScripter-RU (after download)"
-                    : apk ? "Install ONScripter-RU" : "Choose the ONScripter-RU APK file...");
+            apkButton.setText(running ? "Install the game engine (after download)"
+                    : apk ? "Install " + new File(Progress.apkPath).getName().replaceFirst("^\\d\\d-", "")
+                    : "Choose the engine APK file...");
             updateSpace();
             handler.postDelayed(this, 500);
         }
@@ -459,6 +477,12 @@ public class MainActivity extends Activity {
             line = line.trim();
             if (line.startsWith("http")) chosen.add(new Item("extra link " + n++, line));
         }
+        if (useOnsNew.isChecked()) {
+            // Shared scripts/graphics go over the game files last (as its INSTALL.txt says),
+            // then the engine APK, which the install button will offer.
+            chosen.add(new Item("ONScripter-NEW - shared files", ONS_NEW + "onscripter-new-android-assets.zip"));
+            chosen.add(new Item("ONScripter-NEW - engine (64-bit)", ONS_NEW + "onscripter-new-android.apk"));
+        }
         if (chosen.isEmpty()) {
             Toast.makeText(this, "Nothing to install. Press \"Find the files\" first.", Toast.LENGTH_LONG).show();
             return;
@@ -469,6 +493,7 @@ public class MainActivity extends Activity {
                 .putString("page", pageUrl.getText().toString().trim())
                 .putString("manual", manualLinks.getText().toString())
                 .putBoolean("delete", deleteArchives.isChecked())
+                .putBoolean("onsnew", useOnsNew.isChecked())
                 .putString("password", password.getText().toString().trim())
                 .putInt("threads", chosenCores())
                 .apply();
