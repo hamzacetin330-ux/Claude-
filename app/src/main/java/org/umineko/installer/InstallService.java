@@ -16,6 +16,7 @@ import android.os.PowerManager;
 import org.apache.commons.compress.PasswordRequiredException;
 import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
 import org.apache.commons.compress.archivers.sevenz.SevenZFile;
+import org.apache.commons.compress.archivers.sevenz.SevenZLayout;
 import org.apache.commons.compress.utils.MultiReadOnlySeekableByteChannel;
 import net.lingala.zip4j.exception.ZipException;
 import net.lingala.zip4j.model.FileHeader;
@@ -47,6 +48,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -738,12 +740,13 @@ public class InstallService extends Service {
         }
     }
 
-    private void extract7z(List<File> parts, File target, String password, String status) throws IOException {
+    private static final int MAX_EXTRACT_THREADS = 4;
+
+    private static SevenZFile open7z(List<File> parts, String password) throws IOException {
         SevenZFile.Builder builder = SevenZFile.builder().setSeekableByteChannel(channel(parts));
         if (password != null && !password.isEmpty()) builder.setPassword(password.toCharArray());
-        SevenZFile sz;
         try {
-            sz = builder.get();
+            return builder.get();
         } catch (PasswordRequiredException e) {
             throw new IOException("The archive needs a password. Type it into the password box.", e);
         } catch (IOException e) {
@@ -751,33 +754,164 @@ public class InstallService extends Service {
             throw new IOException("Could not open the archive - the password is probably wrong, "
                     + "or a part is damaged. (" + e.getMessage() + ")", e);
         }
-        try (SevenZFile ignored = sz) {
-            long total = 0;
-            for (SevenZArchiveEntry e : sz.getEntries()) total += Math.max(0, e.getSize());
-            long done = 0;
-            SevenZArchiveEntry entry;
-            while ((entry = sz.getNextEntry()) != null) {
-                if (Progress.stopRequested) return;
-                File out = safeFile(target, entry.getName());
-                if (entry.isDirectory()) {
-                    out.mkdirs();
-                    continue;
+    }
+
+    /**
+     * Extracts a 7z archive on several threads. Each thread opens the archive itself and
+     * unpacks a run of whole compressed blocks, so no block is decoded twice. A solid archive
+     * (one big block) simply ends up on one thread.
+     */
+    private void extract7z(List<File> parts, File target, String password, String status) throws IOException {
+        List<SevenZArchiveEntry> entries = new ArrayList<>();
+        SevenZLayout layout;
+        try (SevenZFile probe = open7z(parts, password)) {
+            for (SevenZArchiveEntry e : probe.getEntries()) entries.add(e);
+            layout = SevenZLayout.of(probe);
+        }
+        long total = 0;
+        for (SevenZArchiveEntry e : entries) total += Math.max(0, e.getSize());
+
+        List<int[]> ranges = splitByBlocks(entries, layout, threadCount(layout));
+        AtomicLong done = new AtomicLong();
+        AtomicReference<IOException> failure = new AtomicReference<>();
+        List<Thread> threads = new ArrayList<>();
+        for (int[] range : ranges) {
+            Thread t = new Thread(() -> {
+                try {
+                    extractRange(parts, password, target, range[0], range[1], done, failure);
+                } catch (IOException e) {
+                    failure.compareAndSet(null, e);
+                } catch (OutOfMemoryError e) {
+                    failure.compareAndSet(null, new IOException("Out of memory while unpacking", e));
                 }
-                if (!entry.hasStream()) {
-                    writeEntry(new java.io.ByteArrayInputStream(new byte[0]), out, done, total, status);
-                    continue;
+            }, "extract-" + range[0]);
+            threads.add(t);
+            t.start();
+        }
+
+        // Status: speed over the last few seconds, not since the start.
+        final long totalBytes = total;
+        long windowStart = System.currentTimeMillis();
+        long windowDone = 0;
+        double speed = 0;
+        for (Thread t : threads) {
+            while (t.isAlive()) {
+                try {
+                    t.join(500);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted", e);
                 }
-                done = writeEntry(sz.getInputStream(entry), out, done, total, status);
+                long now = System.currentTimeMillis();
+                long d = done.get();
+                if (now - windowStart >= 3000) {
+                    double recent = (d - windowDone) * 1000.0 / (now - windowStart);
+                    speed = speed == 0 ? recent : speed * 0.6 + recent * 0.4;
+                    windowDone = d;
+                    windowStart = now;
+                }
+                setStatus(status + "\n" + eta(d, totalBytes, speed) + ranges.size() + " threads"
+                                + (currentEntry != null ? "  \u00b7  " + currentEntry : ""),
+                        totalBytes > 0 ? (int) (d * 1000 / totalBytes) : -1);
             }
-        } catch (PasswordRequiredException e) {
-            throw new IOException("The archive needs a password. Type it into the password box.", e);
-        } catch (IOException e) {
+        }
+        IOException e = failure.get();
+        if (e != null) {
             if (password != null && !password.isEmpty() && String.valueOf(e.getMessage()).contains("Checksum")) {
                 throw new IOException("Could not unpack the archive - the password may be wrong, "
                         + "or a part is damaged. (" + e.getMessage() + ")", e);
             }
             throw e;
         }
+    }
+
+    /** How many threads to use: limited by cores and by memory for the LZMA dictionaries. */
+    private static int threadCount(SevenZLayout layout) {
+        int cores = Runtime.getRuntime().availableProcessors();
+        long heap = Runtime.getRuntime().maxMemory();
+        long perThread = Math.min(layout.maxDictionary, 1L << 31) + (8L << 20);
+        int byMemory = (int) Math.max(1, (heap / 2) / perThread);
+        return Math.max(1, Math.min(MAX_EXTRACT_THREADS, Math.min(cores - 1, byMemory)));
+    }
+
+    /**
+     * Splits entries into at most n contiguous runs of roughly equal size, cutting only between
+     * compressed blocks. Returns [from, to) index pairs.
+     */
+    private static List<int[]> splitByBlocks(List<SevenZArchiveEntry> entries, SevenZLayout layout, int n) {
+        List<int[]> ranges = new ArrayList<>();
+        int count = entries.size();
+        if (n <= 1 || layout.entryBlock == null || layout.entryBlock.length != count) {
+            ranges.add(new int[]{0, count});
+            return ranges;
+        }
+        long total = 0;
+        for (SevenZArchiveEntry e : entries) total += Math.max(0, e.getSize());
+        long target = Math.max(1, total / n);
+        int from = 0;
+        long acc = 0;
+        int lastBlock = -1;
+        for (int i = 0; i < count; i++) {
+            int block = layout.entryBlock[i];
+            boolean boundary = block >= 0 && block != lastBlock;
+            if (boundary && acc >= target && ranges.size() < n - 1) {
+                ranges.add(new int[]{from, i});
+                from = i;
+                acc = 0;
+            }
+            if (block >= 0) lastBlock = block;
+            acc += Math.max(0, entries.get(i).getSize());
+        }
+        ranges.add(new int[]{from, count});
+        return ranges;
+    }
+
+    private void extractRange(List<File> parts, String password, File target, int from, int to,
+                              AtomicLong done, AtomicReference<IOException> failure) throws IOException {
+        try (SevenZFile sz = open7z(parts, password)) {
+            List<SevenZArchiveEntry> list = new ArrayList<>();
+            for (SevenZArchiveEntry e : sz.getEntries()) list.add(e);
+            byte[] buf = new byte[BUFFER];
+            for (int i = from; i < to; i++) {
+                if (Progress.stopRequested || failure.get() != null) return;
+                SevenZArchiveEntry entry = list.get(i);
+                File out = safeFile(target, entry.getName());
+                if (entry.isDirectory()) {
+                    out.mkdirs();
+                    continue;
+                }
+                File parent = out.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                    throw new IOException("Cannot create " + parent);
+                }
+                currentEntry = out.getName();
+                try (OutputStream os = new FileOutputStream(out)) {
+                    // Empty files and directories never touch the decoder (that would make it
+                    // restart the current block).
+                    if (!entry.hasStream() || entry.getSize() == 0) continue;
+                    try (InputStream in = sz.getInputStream(entry)) {
+                        int r;
+                        while ((r = in.read(buf)) > 0) {
+                            os.write(buf, 0, r);
+                            done.addAndGet(r);
+                            if (failure.get() != null) return;
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new IOException(entry.getName() + ": " + e.getMessage(), e);
+                }
+            }
+        }
+    }
+
+    /** "42% · 35.0 MB/s · about 6 min left · ", or "" while there isn't enough data yet. */
+    private String eta(long done, long total, double perSec) {
+        if (total <= 0 || perSec <= 0) return "";
+        long left = (long) ((total - done) / perSec);
+        String time = left >= 3600 ? String.format(Locale.ROOT, "%dh %02dmin", left / 3600, left / 60 % 60)
+                : left >= 60 ? (left / 60) + " min" : left + " s";
+        return String.format(Locale.ROOT, "%d%%  \u00b7  %.1f MB/s  \u00b7  about %s left  \u00b7  ",
+                done * 100 / total, perSec / 1048576.0, time);
     }
 
     private long writeEntry(InputStream in, File out, long done, long total, String status) throws IOException {
