@@ -82,7 +82,6 @@ public class InstallService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         // Big speed-ups for the encrypted, many-file resource archive (see CachingAes256Decoder).
         org.apache.commons.compress.archivers.sevenz.CachingAes256Decoder.install();
-        org.tukaani.xz.ArrayCache.setDefaultCache(org.tukaani.xz.BasicArrayCache.getInstance());
         if (intent == null || Progress.running) return START_NOT_STICKY;
         notifications = getSystemService(NotificationManager.class);
         if (Build.VERSION.SDK_INT >= 26) {
@@ -166,13 +165,14 @@ public class InstallService extends Service {
 
             String base = volumeBase(file);
             if (pending != null && !pending.base.equals(base)) {
-                if (!finishVolumes(pending, target, deleteArchives, password, done, prefs)) return;
+                if (!finishVolumes(pending, items, downloads, target, deleteArchives, password, done, prefs)) return;
                 pending = null;
             }
             if (base != null) {
                 if (pending == null) pending = new Volumes(base);
                 pending.parts.add(file);
                 pending.keys.add(key);
+                pending.items.put(file, i);
                 continue;
             }
 
@@ -192,7 +192,10 @@ public class InstallService extends Service {
             done.add(key);
             prefs.edit().putStringSet("done", new HashSet<>(done)).apply();
         }
-        if (pending != null && !finishVolumes(pending, target, deleteArchives, password, done, prefs)) return;
+        if (pending != null
+                && !finishVolumes(pending, items, downloads, target, deleteArchives, password, done, prefs)) {
+            return;
+        }
         if (deleteArchives) {
             File[] left = downloads.listFiles();
             if (left == null || left.length == 0) downloads.delete();
@@ -203,6 +206,8 @@ public class InstallService extends Service {
         final String base;
         final List<File> parts = new ArrayList<>();
         final List<String> keys = new ArrayList<>();
+        /** Part file -> index of the item it was downloaded for. */
+        final Map<File, Integer> items = new java.util.HashMap<>();
 
         Volumes(String base) {
             this.base = base;
@@ -217,32 +222,104 @@ public class InstallService extends Service {
         return m.matches() ? m.group(1).toLowerCase(Locale.ROOT) : null;
     }
 
-    /** Extracts a complete split archive; returns false if the user pressed Stop. */
-    private boolean finishVolumes(Volumes v, File target, boolean deleteArchives, String password,
-                                  Set<String> done, SharedPreferences prefs) throws IOException {
-        v.parts.sort((a, b) -> {
-            Matcher ma = VOLUME.matcher(a.getName());
-            Matcher mb = VOLUME.matcher(b.getName());
-            ma.matches();
-            mb.matches();
-            return Integer.compare(Integer.parseInt(ma.group(2)), Integer.parseInt(mb.group(2)));
-        });
-        for (int n = 0; n < v.parts.size(); n++) {
-            Matcher m = VOLUME.matcher(v.parts.get(n).getName());
-            m.matches();
-            if (Integer.parseInt(m.group(2)) != n + 1) {
-                throw new IOException("Part ." + String.format(Locale.ROOT, "%03d", n + 1) + " of " + v.base
-                        + " is missing. Make sure every resource file is ticked.");
+    /**
+     * Extracts a complete split archive; returns false if the user pressed Stop.
+     *
+     * If the data turns out to be corrupt, every part is checked against its md5: damaged parts
+     * are downloaded again, and if all parts are fine the extraction is retried once with the
+     * stock (slower) AES decoder in case the fast one is at fault.
+     */
+    private boolean finishVolumes(Volumes v, List<Item> items, File dir, File target, boolean deleteArchives,
+                                  String password, Set<String> done, SharedPreferences prefs) throws Exception {
+        boolean useStockDecoder = false;
+        for (int attempt = 0; ; attempt++) {
+            sortAndCheckParts(v);
+            String status = "Extracting " + v.base + " (" + v.parts.size() + " parts)"
+                    + (useStockDecoder ? " - retrying the slow, safe way" : "");
+            setStatus(status, -1);
+            if (useStockDecoder) {
+                org.apache.commons.compress.archivers.sevenz.CachingAes256Decoder.uninstall();
+            } else {
+                org.apache.commons.compress.archivers.sevenz.CachingAes256Decoder.install();
+            }
+            try {
+                extract(v.parts, target, password, status);
+                break;
+            } catch (IOException e) {
+                if (!isCorruptData(e) || attempt >= 3) throw e;
+
+                setStatus("The archive data looks damaged. Checking all " + v.parts.size() + " parts...", -1);
+                List<File> bad = new ArrayList<>();
+                for (int n = 0; n < v.parts.size(); n++) {
+                    File part = v.parts.get(n);
+                    Item item = items.get(v.items.get(part));
+                    if (item.md5 == null) continue;
+                    setStatus("The archive data looks damaged. Checking part " + (n + 1) + " of "
+                            + v.parts.size() + "...", n * 1000 / v.parts.size());
+                    String got = md5(part);
+                    if (got == null) return false; // stopped
+                    if (!got.equalsIgnoreCase(item.md5)) bad.add(part);
+                }
+
+                if (!bad.isEmpty()) {
+                    for (File part : bad) {
+                        int index = v.items.get(part);
+                        setStatus("Part " + part.getName().replaceFirst("^\\d\\d-", "")
+                                + " was damaged. Downloading it again...", -1);
+                        part.delete();
+                        new File(dir, String.format(Locale.ROOT, "%02d.ok", index)).delete();
+                        new File(dir, String.format(Locale.ROOT, "%02d.name", index)).delete();
+                        Slot slot = new Slot(part.getName());
+                        File fresh = download(items.get(index), dir, index, slot);
+                        if (fresh == null) return false; // stopped
+                        int pos = v.parts.indexOf(part);
+                        v.parts.set(pos, fresh);
+                        v.items.remove(part);
+                        v.items.put(fresh, index);
+                    }
+                } else if (!useStockDecoder) {
+                    useStockDecoder = true;
+                } else {
+                    throw new IOException("All parts of " + v.base + " are complete (md5 is correct), "
+                            + "but the archive still could not be unpacked: " + e.getMessage(), e);
+                }
             }
         }
-        String status = "Extracting " + v.base + " (" + v.parts.size() + " parts)";
-        setStatus(status, -1);
-        extract(v.parts, target, password, status);
+        org.apache.commons.compress.archivers.sevenz.CachingAes256Decoder.install();
         if (Progress.stopRequested) return false;
         if (deleteArchives) for (File f : v.parts) f.delete();
         done.addAll(v.keys);
         prefs.edit().putStringSet("done", new HashSet<>(done)).apply();
         return true;
+    }
+
+    private void sortAndCheckParts(Volumes v) throws IOException {
+        v.parts.sort((a, b) -> Integer.compare(partNumber(a), partNumber(b)));
+        for (int n = 0; n < v.parts.size(); n++) {
+            if (partNumber(v.parts.get(n)) != n + 1) {
+                throw new IOException("Part ." + String.format(Locale.ROOT, "%03d", n + 1) + " of " + v.base
+                        + " is missing. Make sure every resource file is ticked.");
+            }
+        }
+    }
+
+    private static int partNumber(File f) {
+        Matcher m = VOLUME.matcher(f.getName());
+        return m.matches() ? Integer.parseInt(m.group(2)) : -1;
+    }
+
+    /** Errors meaning the archive's bytes are wrong (as opposed to e.g. a full disk). */
+    private static boolean isCorruptData(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            String n = t.getClass().getSimpleName();
+            String m = String.valueOf(t.getMessage()).toLowerCase(Locale.ROOT);
+            if (n.contains("Corrupted") || n.contains("CRC") || m.contains("corrupt")
+                    || m.contains("checksum") || m.contains("crc") || m.contains("no header")
+                    || m.contains("decryption failed") || m.contains("truncated")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- downloading
@@ -356,8 +433,13 @@ public class InstallService extends Service {
         File okFile = new File(dir, String.format(Locale.ROOT, "%02d.ok", index));
         File nameFile = new File(dir, String.format(Locale.ROOT, "%02d.name", index));
         if (okFile.exists() && nameFile.exists()) {
+            String owner = readSmall(okFile);
             File finished = new File(dir, readSmall(nameFile));
-            if (finished.exists()) return finished;
+            // "ok" = written by an older version, which didn't record the item.
+            if (finished.exists() && (owner.equals(item.key()) || owner.equals("ok"))) return finished;
+            okFile.delete();
+            nameFile.delete();
+            finished.delete();
         }
 
         List<String> problems = new ArrayList<>();
@@ -379,7 +461,7 @@ public class InstallService extends Service {
                             throw new MirrorFailed("the downloaded file was damaged (md5 did not match)");
                         }
                     }
-                    writeSmall(okFile, "ok");
+                    writeSmall(okFile, item.key());
                     return f;
                 } catch (MirrorFailed e) {
                     problems.add("mirror " + (m + 1) + ": " + e.getMessage());
@@ -582,8 +664,23 @@ public class InstallService extends Service {
     /** When the current extraction started, for the speed / time-left estimate. */
     private long extractStartMs;
 
+    /** Entry currently being written, for error messages. */
+    private volatile String currentEntry;
+
     private void extract(List<File> parts, File target, String password, String status) throws IOException {
         extractStartMs = System.currentTimeMillis();
+        currentEntry = null;
+        try {
+            extractArchive(parts, target, password, status);
+        } catch (IOException e) {
+            String archive = parts.get(0).getName().replaceFirst("^\\d\\d-", "");
+            String where = currentEntry != null ? " (while writing " + currentEntry + ")" : "";
+            IOException named = new IOException(archive + where + ": " + e.getMessage(), e);
+            throw named;
+        }
+    }
+
+    private void extractArchive(List<File> parts, File target, String password, String status) throws IOException {
         File first = parts.get(0);
         byte[] magic = new byte[6];
         try (InputStream in = new java.io.FileInputStream(first)) {
@@ -684,6 +781,7 @@ public class InstallService extends Service {
     }
 
     private long writeEntry(InputStream in, File out, long done, long total, String status) throws IOException {
+        currentEntry = out.getName();
         File parent = out.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
             throw new IOException("Cannot create " + parent);

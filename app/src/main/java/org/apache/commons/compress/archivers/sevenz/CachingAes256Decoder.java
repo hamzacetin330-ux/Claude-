@@ -57,6 +57,22 @@ public final class CachingAes256Decoder extends AbstractCoder {
         }
     }
 
+    /** Puts the stock decoder back (used to retry when an archive fails to unpack). */
+    @SuppressWarnings("unchecked")
+    public static synchronized void uninstall() {
+        try {
+            Field f = Coders.class.getDeclaredField("CODER_MAP");
+            f.setAccessible(true);
+            Map<SevenZMethod, AbstractCoder> map = (Map<SevenZMethod, AbstractCoder>) f.get(null);
+            AbstractCoder current = map.get(SevenZMethod.AES256SHA256);
+            if (current instanceof CachingAes256Decoder) {
+                map.put(SevenZMethod.AES256SHA256, ((CachingAes256Decoder) current).original);
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            // nothing to undo
+        }
+    }
+
     @Override
     InputStream decode(String archiveName, InputStream in, long uncompressedLength, Coder coder, byte[] password,
                        int maxMemoryLimitInKb) throws IOException {
