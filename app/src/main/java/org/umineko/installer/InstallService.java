@@ -782,13 +782,14 @@ public class InstallService extends Service {
         for (SevenZArchiveEntry e : entries) total += Math.max(0, e.getSize());
 
         List<int[]> ranges = splitByBlocks(entries, layout, threadCount(layout));
+        catchingUp.set(0);
         AtomicLong done = new AtomicLong();
         AtomicReference<IOException> failure = new AtomicReference<>();
         List<Thread> threads = new ArrayList<>();
         for (int[] range : ranges) {
             Thread t = new Thread(() -> {
                 try {
-                    extractRange(parts, password, target, range[0], range[1], done, failure);
+                    extractRange(parts, password, target, range[0], range[1], layout.entryBlock, done, failure);
                 } catch (IOException e) {
                     failure.compareAndSet(null, e);
                 } catch (OutOfMemoryError e) {
@@ -820,8 +821,10 @@ public class InstallService extends Service {
                     windowDone = d;
                     windowStart = now;
                 }
-                setStatus(status + "\n" + eta(d, totalBytes, speed) + ranges.size() + " threads"
-                                + (currentEntry != null ? "  \u00b7  " + currentEntry : ""),
+                String what = catchingUp.get() > 0
+                        ? "catching up to where it stopped (no new files yet)"
+                        : currentEntry != null ? currentEntry : "";
+                setStatus(status + "\n" + eta(d, totalBytes, speed) + ranges.size() + " threads  \u00b7  " + what,
                         totalBytes > 0 ? (int) (d * 1000 / totalBytes) : -1);
             }
         }
@@ -895,45 +898,92 @@ public class InstallService extends Service {
         return ranges;
     }
 
+    /** Threads currently re-reading already extracted data to reach where the last run stopped. */
+    private final AtomicInteger catchingUp = new AtomicInteger();
+
     private void extractRange(List<File> parts, String password, File target, int from, int to,
-                              AtomicLong done, AtomicReference<IOException> failure) throws IOException {
+                              int[] entryBlock, AtomicLong done, AtomicReference<IOException> failure)
+            throws IOException {
         try (SevenZFile sz = open7z(parts, password)) {
             List<SevenZArchiveEntry> list = new ArrayList<>();
             for (SevenZArchiveEntry e : sz.getEntries()) list.add(e);
-            byte[] buf = new byte[BUFFER];
+
+            // Which files still need writing (a previous run may have done some already)...
+            boolean[] needed = new boolean[to - from];
             for (int i = from; i < to; i++) {
                 if (Progress.stopRequested || failure.get() != null) return;
-                SevenZArchiveEntry entry = list.get(i);
-                File out = safeFile(target, entry.getName());
-                if (entry.isDirectory()) {
-                    out.mkdirs();
-                    continue;
-                }
-                File parent = out.getParentFile();
-                if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
-                    throw new IOException("Cannot create " + parent);
-                }
-                currentEntry = out.getName();
-                if (alreadyExtracted(out, entry)) {
-                    done.addAndGet(entry.getSize());
-                    continue;
-                }
-                try (OutputStream os = openOutput(out, entry.getName())) {
-                    if (os == null) continue; // refused by the system; listed at the end
-                    // Empty files and directories never touch the decoder (that would make it
-                    // restart the current block).
-                    if (!entry.hasStream() || entry.getSize() == 0) continue;
-                    try (InputStream in = sz.getInputStream(entry)) {
-                        int r;
-                        while ((r = in.read(buf)) > 0) {
-                            os.write(buf, 0, r);
-                            done.addAndGet(r);
-                            if (failure.get() != null) return;
-                        }
+                SevenZArchiveEntry e = list.get(i);
+                needed[i - from] = !e.isDirectory() && !alreadyExtracted(safeFile(target, e.getName()), e);
+            }
+            // ...and, per compressed block, the last one. In a solid block everything before that
+            // has to be decoded again to get there (the decoder can't jump into a block), so it
+            // is read through and counted as progress; everything after it is skipped for free.
+            Map<Integer, Integer> lastNeeded = new java.util.HashMap<>();
+            for (int i = from; i < to; i++) {
+                int block = entryBlock != null ? entryBlock[i] : -1;
+                if (needed[i - from] && block >= 0) lastNeeded.put(block, i);
+            }
+
+            byte[] buf = new byte[BUFFER];
+            boolean caughtUp = true;
+            try {
+                for (int i = from; i < to; i++) {
+                    if (Progress.stopRequested || failure.get() != null) return;
+                    SevenZArchiveEntry entry = list.get(i);
+                    File out = safeFile(target, entry.getName());
+                    if (entry.isDirectory()) {
+                        out.mkdirs();
+                        continue;
                     }
-                } catch (IOException e) {
-                    throw new IOException(entry.getName() + ": " + e.getMessage(), e);
+                    boolean hasData = entry.hasStream() && entry.getSize() > 0;
+                    if (!needed[i - from]) {
+                        int block = entryBlock != null ? entryBlock[i] : -1;
+                        Integer last = block >= 0 ? lastNeeded.get(block) : null;
+                        if (hasData && last != null && i < last) {
+                            if (caughtUp) {
+                                caughtUp = false;
+                                catchingUp.incrementAndGet();
+                            }
+                            try (InputStream in = sz.getInputStream(entry)) {
+                                int r;
+                                while ((r = in.read(buf)) > 0) {
+                                    done.addAndGet(r);
+                                    if (Progress.stopRequested || failure.get() != null) return;
+                                }
+                            }
+                        } else {
+                            done.addAndGet(Math.max(0, entry.getSize()));
+                        }
+                        continue;
+                    }
+                    if (!caughtUp) {
+                        caughtUp = true;
+                        catchingUp.decrementAndGet();
+                    }
+
+                    File parent = out.getParentFile();
+                    if (parent != null && !parent.isDirectory() && !parent.mkdirs() && !parent.isDirectory()) {
+                        throw new IOException("Cannot create " + parent);
+                    }
+                    currentEntry = out.getName();
+                    try (OutputStream os = openOutput(out, entry.getName())) {
+                        if (os == null) continue; // refused by the system; listed at the end
+                        // Empty files never touch the decoder (that would make it restart the block).
+                        if (!hasData) continue;
+                        try (InputStream in = sz.getInputStream(entry)) {
+                            int r;
+                            while ((r = in.read(buf)) > 0) {
+                                os.write(buf, 0, r);
+                                done.addAndGet(r);
+                                if (failure.get() != null) return;
+                            }
+                        }
+                    } catch (IOException e) {
+                        throw new IOException(entry.getName() + ": " + e.getMessage(), e);
+                    }
                 }
+            } finally {
+                if (!caughtUp) catchingUp.decrementAndGet();
             }
         }
     }
