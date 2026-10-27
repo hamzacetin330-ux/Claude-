@@ -66,6 +66,8 @@ public class InstallService extends Service {
     public static final String EXTRA_TARGET = "target";
     public static final String EXTRA_DELETE_ARCHIVES = "delete_archives";
     public static final String EXTRA_PASSWORD = "password";
+    /** Cores to unpack with: 0 = pick automatically. */
+    public static final String EXTRA_THREADS = "threads";
 
     static final String PREFS = "install";
     private static final String CHANNEL = "install";
@@ -101,6 +103,7 @@ public class InstallService extends Service {
         File target = new File(intent.getStringExtra(EXTRA_TARGET));
         boolean deleteArchives = intent.getBooleanExtra(EXTRA_DELETE_ARCHIVES, true);
         String password = intent.getStringExtra(EXTRA_PASSWORD);
+        requestedThreads = intent.getIntExtra(EXTRA_THREADS, 0);
 
         PowerManager pm = getSystemService(PowerManager.class);
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UminekoInstaller:install");
@@ -825,13 +828,32 @@ public class InstallService extends Service {
         }
     }
 
-    /** How many threads to use: limited by cores and by memory for the LZMA dictionaries. */
-    private static int threadCount(SevenZLayout layout) {
+    /** Cores chosen in the app (0 = auto). */
+    private volatile int requestedThreads;
+
+    /** Threads "Auto" picks: half the cores (max 4), and 1 on low-memory devices. */
+    static int autoThreads(Context context) {
+        try {
+            android.app.ActivityManager am = context.getSystemService(android.app.ActivityManager.class);
+            if (am != null && am.isLowRamDevice()) return 1;
+        } catch (RuntimeException ignored) {
+            // can't tell; go by cores
+        }
+        int cores = Runtime.getRuntime().availableProcessors();
+        return Math.max(1, Math.min(MAX_EXTRACT_THREADS, cores / 2));
+    }
+
+    /**
+     * How many threads to use: the user's choice (or auto), never more than the cores, and
+     * never more than the LZMA dictionaries fit in memory.
+     */
+    private int threadCount(SevenZLayout layout) {
+        int wanted = requestedThreads > 0 ? requestedThreads : autoThreads(this);
         int cores = Runtime.getRuntime().availableProcessors();
         long heap = Runtime.getRuntime().maxMemory();
         long perThread = Math.min(layout.maxDictionary, 1L << 31) + (8L << 20);
         int byMemory = (int) Math.max(1, (heap / 2) / perThread);
-        return Math.max(1, Math.min(MAX_EXTRACT_THREADS, Math.min(cores - 1, byMemory)));
+        return Math.max(1, Math.min(wanted, Math.min(cores, byMemory)));
     }
 
     /**

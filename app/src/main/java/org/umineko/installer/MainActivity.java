@@ -33,6 +33,8 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -60,6 +62,10 @@ public class MainActivity extends Activity {
     private EditText manualLinks;
     private EditText password;
     private CheckBox deleteArchives;
+    private RadioGroup coresGroup;
+    /** Choices for "Unpacking speed": label and number of cores (0 = auto). */
+    private static final String[] CORE_LABELS = {"Auto", "1", "2", "4"};
+    private static final int[] CORE_VALUES = {0, 1, 2, 4};
     private LinearLayout itemList;
     private TextView itemHeader;
     private Button permissionButton;
@@ -179,6 +185,27 @@ public class MainActivity extends Activity {
         deleteArchives.setTextColor(TEXT);
         deleteArchives.setChecked(prefs.getBoolean("delete", true));
         c3.addView(deleteArchives);
+
+        c3.addView(label("Unpacking speed (CPU cores)"));
+        coresGroup = new RadioGroup(this);
+        coresGroup.setOrientation(RadioGroup.HORIZONTAL);
+        int savedCores = prefs.getInt("threads", 0);
+        for (int i = 0; i < CORE_LABELS.length; i++) {
+            RadioButton rb = new RadioButton(this);
+            rb.setId(View.generateViewId());
+            rb.setText(CORE_LABELS[i]);
+            rb.setTextColor(TEXT);
+            rb.setTextSize(14);
+            rb.setTag(CORE_VALUES[i]);
+            rb.setPadding(0, 0, dp(10), 0);
+            coresGroup.addView(rb);
+            if (CORE_VALUES[i] == savedCores) rb.setChecked(true);
+        }
+        c3.addView(coresGroup);
+        int auto = InstallService.autoThreads(this);
+        c3.addView(text("More cores unpack faster but use more power and memory. Auto uses "
+                + auto + (auto == 1 ? " core" : " cores") + " on this device. Pick 1 core if your phone "
+                + "gets hot or the app closes while unpacking.", 12, MUTED));
         c3.addView(space(8));
         startButton = primaryButton("Download & install everything", v -> start());
         c3.addView(startButton);
@@ -395,6 +422,11 @@ public class MainActivity extends Activity {
         }
     }
 
+    private int chosenCores() {
+        View checked = coresGroup.findViewById(coresGroup.getCheckedRadioButtonId());
+        return checked != null && checked.getTag() instanceof Integer ? (Integer) checked.getTag() : 0;
+    }
+
     private void selectAll(boolean on) {
         for (CheckBox cb : boxes) cb.setChecked(on);
     }
@@ -422,6 +454,7 @@ public class MainActivity extends Activity {
                 .putString("manual", manualLinks.getText().toString())
                 .putBoolean("delete", deleteArchives.isChecked())
                 .putString("password", password.getText().toString().trim())
+                .putInt("threads", chosenCores())
                 .apply();
 
         StringBuilder list = new StringBuilder();
@@ -436,7 +469,8 @@ public class MainActivity extends Activity {
                             .putExtra(InstallService.EXTRA_ITEMS, Item.toJson(chosen))
                             .putExtra(InstallService.EXTRA_TARGET, target)
                             .putExtra(InstallService.EXTRA_DELETE_ARCHIVES, deleteArchives.isChecked())
-                            .putExtra(InstallService.EXTRA_PASSWORD, password.getText().toString().trim());
+                            .putExtra(InstallService.EXTRA_PASSWORD, password.getText().toString().trim())
+                            .putExtra(InstallService.EXTRA_THREADS, chosenCores());
                     startForegroundService(i);
                 })
                 .setNegativeButton("Cancel", null)
