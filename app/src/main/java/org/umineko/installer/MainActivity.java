@@ -222,7 +222,11 @@ public class MainActivity extends Activity {
         statusText.setTextIsSelectable(true);
         statusText.setPadding(0, dp(6), 0, 0);
         c3.addView(statusText);
-        stopButton = secondaryButton("Stop", v -> Progress.stopRequested = true);
+        stopButton = secondaryButton("Stop", v -> {
+            InstallService.requestStop();
+            stopButton.setText("Stopping...");
+            stopButton.setEnabled(false);
+        });
         c3.addView(stopButton);
 
         // 4. Engine
@@ -289,6 +293,10 @@ public class MainActivity extends Activity {
             startButton.setEnabled(!running);
             startButton.setAlpha(running ? 0.5f : 1f);
             stopButton.setVisibility(running ? View.VISIBLE : View.GONE);
+            if (!running) {
+                stopButton.setText("Stop");
+                stopButton.setEnabled(true);
+            }
             statusText.setText(Progress.status);
             statusText.setVisibility(TextUtils.isEmpty(Progress.status) ? View.GONE : View.VISIBLE);
 

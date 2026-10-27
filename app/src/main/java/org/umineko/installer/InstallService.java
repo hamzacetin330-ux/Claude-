@@ -485,7 +485,7 @@ public class InstallService extends Service {
                         break;
                     }
                     slot.note = "connection problem, retrying (" + (attempt + 1) + "/4)...";
-                    Thread.sleep(Math.min(60000, 3000L << attempt));
+                    sleepUnlessStopped(Math.min(60000, 3000L << attempt));
                 }
             }
         }
@@ -508,22 +508,22 @@ public class InstallService extends Service {
         int code = c.getResponseCode();
         if (code == 416) { // already have the whole thing
             have = 0;
-            c.disconnect();
+            close(c);
             part.delete();
             c = open(url, 0);
             code = c.getResponseCode();
         }
         if (code == 404 || code == 403 || code == 410 || code == 401) {
-            c.disconnect();
+            close(c);
             throw new MirrorFailed("server answered HTTP " + code);
         }
         if (code != 200 && code != 206) {
-            c.disconnect();
+            close(c);
             throw new IOException("server answered HTTP " + code);
         }
         String type = c.getContentType();
         if (type != null && type.toLowerCase(Locale.ROOT).startsWith("text/html")) {
-            c.disconnect();
+            close(c);
             throw new MirrorFailed("it opened a web page instead of the file");
         }
         if (code == 200) have = 0; // server ignored Range: start over
@@ -553,7 +553,7 @@ public class InstallService extends Service {
             }
             if (total > 0 && got < total) throw new IOException("connection closed early");
         } finally {
-            c.disconnect();
+            close(c);
         }
 
         File finished = new File(dir, name);
@@ -597,9 +597,53 @@ public class InstallService extends Service {
         }
     }
 
+    /** Connections in use, so Stop can cut them instead of waiting for a stalled read. */
+    private static final Set<HttpURLConnection> ACTIVE = ConcurrentHashMap.newKeySet();
+
+    private static void close(HttpURLConnection c) {
+        ACTIVE.remove(c);
+        c.disconnect();
+    }
+
+    /**
+     * Called by the Stop button. Raises the flag, cuts running downloads, and as a last resort
+     * closes the app if the work hasn't stopped after 15 s (everything resumes on the next run).
+     */
+    public static void requestStop() {
+        Progress.stopRequested = true;
+        Progress.status = "Stopping...";
+        new Thread(() -> {
+            for (HttpURLConnection c : ACTIVE.toArray(new HttpURLConnection[0])) {
+                try {
+                    close(c);
+                } catch (RuntimeException ignored) {
+                    // already closed
+                }
+            }
+            for (int i = 0; i < 150 && Progress.running; i++) {
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+            if (Progress.running) android.os.Process.killProcess(android.os.Process.myPid());
+        }, "stop").start();
+    }
+
+    /** Sleeps, but wakes up early when Stop is pressed. */
+    private static void sleepUnlessStopped(long ms) throws InterruptedException {
+        long end = System.currentTimeMillis() + ms;
+        while (!Progress.stopRequested && System.currentTimeMillis() < end) {
+            Thread.sleep(Math.min(200, Math.max(1, end - System.currentTimeMillis())));
+        }
+    }
+
     private static HttpURLConnection open(String url, long from) throws IOException {
         for (int hops = 0; hops < 10; hops++) {
+            if (Progress.stopRequested) throw new IOException("Stopped");
             HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
+            ACTIVE.add(c);
             c.setInstanceFollowRedirects(false);
             c.setConnectTimeout(30000);
             c.setReadTimeout(60000);
@@ -608,7 +652,7 @@ public class InstallService extends Service {
             int code = c.getResponseCode();
             if (code >= 300 && code < 400 && c.getHeaderField("Location") != null) {
                 url = new URL(new URL(url), c.getHeaderField("Location")).toString();
-                c.disconnect();
+                close(c);
                 continue;
             }
             return c;
@@ -634,7 +678,7 @@ public class InstallService extends Service {
                 throw new IOException("Unexpected Yandex Disk reply", e);
             }
         } finally {
-            c.disconnect();
+            close(c);
         }
     }
 
@@ -975,7 +1019,7 @@ public class InstallService extends Service {
                             while ((r = in.read(buf)) > 0) {
                                 os.write(buf, 0, r);
                                 done.addAndGet(r);
-                                if (failure.get() != null) return;
+                                if (Progress.stopRequested || failure.get() != null) return;
                             }
                         }
                     } catch (IOException e) {
@@ -1028,6 +1072,7 @@ public class InstallService extends Service {
             if (os == null) return done;
             int r;
             while ((r = in.read(buf)) > 0) {
+                if (Progress.stopRequested) return done;
                 os.write(buf, 0, r);
                 done += r;
                 long now = System.currentTimeMillis();
