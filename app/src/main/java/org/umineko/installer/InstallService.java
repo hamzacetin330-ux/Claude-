@@ -39,6 +39,14 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
@@ -137,8 +145,13 @@ public class InstallService extends Service {
         SharedPreferences prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         Set<String> done = new HashSet<>(prefs.getStringSet("done", new HashSet<>()));
 
-        // Parts of a split archive (name.7z.001, name.7z.002, ...) are only extracted once
-        // the whole set is downloaded, before anything that comes after them on the page.
+        // 1. Download every file that isn't installed yet, several at a time: the mirrors limit
+        //    the speed of each connection, so parallel downloads use much more of the line.
+        Map<Integer, File> files = downloadAll(items, target, downloads, done);
+        if (files == null) return; // stopped
+
+        // 2. Install in page order. Parts of a split archive (name.7z.001, .002, ...) are
+        //    extracted together, before anything that comes after them on the page.
         Volumes pending = null;
 
         for (int i = 0; i < items.size(); i++) {
@@ -149,8 +162,7 @@ public class InstallService extends Service {
             if (done.contains(key)) continue;
 
             String prefix = "(" + (i + 1) + "/" + items.size() + ") ";
-            File file = download(item, downloads, i, prefix);
-            if (file == null) return; // stopped
+            File file = files.get(i);
 
             String base = volumeBase(file);
             if (pending != null && !pending.base.equals(base)) {
@@ -242,9 +254,105 @@ public class InstallService extends Service {
         }
     }
 
+    private static final int PARALLEL_DOWNLOADS = 4;
+
+    /** Progress of one running download, shown in the combined status. */
+    private static final class Slot {
+        final String name;
+        volatile long got;
+        volatile long total = -1;
+        volatile String note;
+
+        Slot(String name) {
+            this.name = name;
+        }
+    }
+
+    private final Map<Integer, Slot> slots = new ConcurrentHashMap<>();
+    private final AtomicLong received = new AtomicLong();
+
+    /**
+     * Downloads all items that aren't installed yet, PARALLEL_DOWNLOADS at a time.
+     * Returns index -> file, or null if the user pressed Stop.
+     */
+    private Map<Integer, File> downloadAll(List<Item> items, File target, File dir, Set<String> done)
+            throws Exception {
+        List<Integer> todo = new ArrayList<>();
+        for (int i = 0; i < items.size(); i++) {
+            if (!done.contains(target.getAbsolutePath() + "|" + items.get(i).key())) todo.add(i);
+        }
+        Map<Integer, File> files = new ConcurrentHashMap<>();
+        List<String> failures = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger finished = new AtomicInteger();
+        slots.clear();
+        received.set(0);
+
+        ExecutorService pool = Executors.newFixedThreadPool(PARALLEL_DOWNLOADS);
+        for (int i : todo) {
+            pool.execute(() -> {
+                Item item = items.get(i);
+                int dash = item.label.indexOf(" - ");
+                Slot slot = new Slot(dash > 0 ? item.label.substring(dash + 3) : item.label);
+                slots.put(i, slot);
+                try {
+                    File f = download(item, dir, i, slot);
+                    if (f != null) files.put(i, f);
+                } catch (Exception e) {
+                    failures.add(e.getMessage());
+                } finally {
+                    slots.remove(i);
+                    finished.incrementAndGet();
+                }
+            });
+        }
+        pool.shutdown();
+
+        // Combined status while the downloads run.
+        long windowStart = System.currentTimeMillis();
+        long windowBytes = 0;
+        double speed = 0;
+        while (!pool.awaitTermination(500, TimeUnit.MILLISECONDS)) {
+            long now = System.currentTimeMillis();
+            if (now - windowStart >= 2000) {
+                long bytes = received.get();
+                speed = (bytes - windowBytes) * 1000.0 / (now - windowStart);
+                windowBytes = bytes;
+                windowStart = now;
+            }
+            StringBuilder sb = new StringBuilder();
+            sb.append("Downloading: ").append(finished.get()).append(" of ").append(todo.size())
+                    .append(" files done");
+            if (speed > 0) sb.append(String.format(Locale.ROOT, "  \u00b7  %.1f MB/s", speed / 1048576.0));
+            long got = 0;
+            long total = 0;
+            for (Map.Entry<Integer, Slot> e : new TreeMap<>(slots).entrySet()) {
+                Slot sl = e.getValue();
+                sb.append("\n\u2022 ").append(sl.name).append("  ");
+                if (sl.note != null) {
+                    sb.append(sl.note);
+                } else {
+                    sb.append(mb(sl.got));
+                    if (sl.total > 0) sb.append(" / ").append(mb(sl.total));
+                }
+                if (sl.total > 0) {
+                    got += sl.got;
+                    total += sl.total;
+                }
+            }
+            if (!failures.isEmpty()) sb.append("\n(").append(failures.size()).append(" failed, will report at the end)");
+            Progress.itemIndex = Math.min(finished.get(), Math.max(0, todo.size() - 1));
+            Progress.itemCount = Math.max(1, todo.size());
+            setStatus(sb.toString(), total > 0 ? (int) (got * 1000 / total) : -1);
+        }
+        Progress.itemCount = items.size();
+
+        if (Progress.stopRequested) return null;
+        if (!failures.isEmpty()) throw new IOException(String.join("\n\n", failures));
+        return files;
+    }
+
     /** Returns the finished (and md5-checked) file, or null if the user pressed Stop. */
-    private File download(Item item, File dir, int index, String prefix) throws Exception {
-        String status = prefix + "Downloading " + item.label;
+    private File download(Item item, File dir, int index, Slot slot) throws Exception {
         File okFile = new File(dir, String.format(Locale.ROOT, "%02d.ok", index));
         File nameFile = new File(dir, String.format(Locale.ROOT, "%02d.name", index));
         if (okFile.exists() && nameFile.exists()) {
@@ -255,15 +363,14 @@ public class InstallService extends Service {
         List<String> problems = new ArrayList<>();
         for (int m = 0; m < item.urls.size(); m++) {
             String mirror = item.urls.get(m);
-            String mirrorStatus = item.urls.size() > 1
-                    ? status + " (mirror " + (m + 1) + "/" + item.urls.size() + ")" : status;
             for (int attempt = 0; attempt < 5; attempt++) {
                 if (Progress.stopRequested) return null;
                 try {
-                    File f = downloadOnce(mirror, dir, index, mirrorStatus);
+                    slot.note = m > 0 ? "trying mirror " + (m + 1) : null;
+                    File f = downloadOnce(mirror, dir, index, slot);
                     if (f == null) return null;
                     if (item.md5 != null) {
-                        setStatus(mirrorStatus + "\nChecking the file...", -1);
+                        slot.note = "checking the file...";
                         String got = md5(f);
                         if (got == null) return null;
                         if (!got.equalsIgnoreCase(item.md5)) {
@@ -283,7 +390,7 @@ public class InstallService extends Service {
                         problems.add("mirror " + (m + 1) + ": " + e.getMessage());
                         break;
                     }
-                    setStatus(mirrorStatus + "\nConnection problem, retrying (" + (attempt + 1) + "/4)...", -1);
+                    slot.note = "connection problem, retrying (" + (attempt + 1) + "/4)...";
                     Thread.sleep(Math.min(60000, 3000L << attempt));
                 }
             }
@@ -291,7 +398,7 @@ public class InstallService extends Service {
         throw new IOException("Could not download " + item.label + "\n" + String.join("\n", problems));
     }
 
-    private File downloadOnce(String mirror, File dir, int index, String status) throws Exception {
+    private File downloadOnce(String mirror, File dir, int index, Slot slot) throws Exception {
         String url = resolve(mirror);
 
         File part = new File(dir, String.format(Locale.ROOT, "%02d.part", index));
@@ -339,18 +446,16 @@ public class InstallService extends Service {
             out.seek(have);
             byte[] buf = new byte[BUFFER];
             long got = have;
-            long lastUpdate = 0;
+            slot.total = total;
+            slot.got = got;
             int r;
             while ((r = in.read(buf)) > 0) {
                 if (Progress.stopRequested) return null;
                 out.write(buf, 0, r);
                 got += r;
-                long now = System.currentTimeMillis();
-                if (now - lastUpdate > 500) {
-                    lastUpdate = now;
-                    int permille = total > 0 ? (int) (got * 1000 / total) : -1;
-                    setStatus(status + "\n" + mb(got) + (total > 0 ? " / " + mb(total) : ""), permille);
-                }
+                slot.got = got;
+                slot.note = null;
+                received.addAndGet(r);
             }
             if (total > 0 && got < total) throw new IOException("connection closed early");
         } finally {
