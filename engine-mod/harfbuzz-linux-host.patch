@@ -1,0 +1,16 @@
+diff --git a/Dependencies/pkgs/harfbuzz.pkgbuild b/Dependencies/pkgs/harfbuzz.pkgbuild
+index 8e9be10..cb59772 100644
+--- a/Dependencies/pkgs/harfbuzz.pkgbuild
++++ b/Dependencies/pkgs/harfbuzz.pkgbuild
+@@ -73,7 +73,10 @@ configure() {
+         lcxf="${lcxf//$outdir/$meson_outdir}"
+         llf="${llf//$outdir/$meson_outdir}"
+     fi
+-    if [ "$(getTarget)" == "droid" ] && command -v cygpath >/dev/null 2>&1; then
++    # Android installs with DESTDIR="$outdir" (see package()), so the prefix
++    # must be "/" on every build host, not only where cygpath exists; an
++    # absolute prefix ends up doubled under DESTDIR on Linux and macOS.
++    if [ "$(getTarget)" == "droid" ]; then
+         meson_prefix="/"
+     fi
+ 
