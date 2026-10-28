@@ -1,0 +1,31 @@
+diff --git a/Support/SDLMixerCompat.cpp b/Support/SDLMixerCompat.cpp
+index 7a795a5..4996d83 100644
+--- a/Support/SDLMixerCompat.cpp
++++ b/Support/SDLMixerCompat.cpp
+@@ -189,12 +189,25 @@ int Mix_OpenAudio(int frequency, SDL_AudioFormat format, int channelCount, int c
+ 	return Mix_OpenAudioDevice(frequency, format, channelCount, chunksize, nullptr, 0);
+ }
+ 
+-int Mix_OpenAudioDevice(int frequency, SDL_AudioFormat format, int channelCount, int /*chunksize*/, const char * /*device*/, int /*allowed_changes*/) {
++int Mix_OpenAudioDevice(int frequency, SDL_AudioFormat format, int channelCount, int chunksize, const char * /*device*/, int /*allowed_changes*/) {
+ 	Mix_CloseAudio();
+ 
+ 	if (!MIX_Init())
+ 		return -1;
+ 
++	// SDL3 sizes the device buffer from this hint rather than from a chunk size,
++	// so turn the configured audiobuffer (bytes) into sample frames. Android
++	// gets at least 4096 frames: Bluetooth output delivers audio in large,
++	// irregular bursts and a ~10 ms buffer underruns there, which is heard as
++	// constant stutter. A visual novel does not notice the extra ~90 ms.
++	int frameBytes = static_cast<int>(SDL_AUDIO_BYTESIZE(format)) * std::max(channelCount, 1);
++	int frames     = frameBytes > 0 ? chunksize / frameBytes : 0;
++#ifdef DROID
++	frames = std::max(frames, 4096);
++#endif
++	if (frames > 0)
++		SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, std::to_string(frames).c_str());
++
+ 	SDL_AudioSpec requested{};
+ 	requested.freq     = frequency;
+ 	requested.format   = format;

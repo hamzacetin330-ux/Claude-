@@ -1,13 +1,10 @@
 name: Build renamed engine
 
-# Takes the latest ONScripter-NEW Android release, renames it to
+# Takes the latest ONScripter-NEW Android release as-is, renames it to
 # "Umineko no Naku Koro ni" with the Beatrice icon (engine-mod/), re-signs it
-# and publishes it as a release.
+# and publishes it as a release. Manual only: the published engine is now
+# built from source with the Bluetooth audio fix (engine-source.yml).
 on:
-  push:
-    paths:
-      - 'engine-mod/**'
-      - '.github/workflows/engine.yml'
   workflow_dispatch:
 
 permissions:

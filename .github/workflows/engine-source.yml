@@ -1,0 +1,116 @@
+name: Build engine from source
+
+# Builds ONScripter-NEW for Android (arm64) from source with the patches in
+# engine-mod/ (bigger audio buffer, which stops Bluetooth stutter), then gives
+# it the name "Umineko no Naku Koro ni" and the Beatrice icon, signs it and
+# publishes it as the umineko-engine release.
+on:
+  push:
+    paths:
+      - 'engine-mod/**'
+      - '.github/workflows/engine-source.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ONS_VERSION: v1.10
+  APP_NAME: Umineko no Naku Koro ni
+  NDK_VERSION: 29.0.14206865
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get ONScripter-NEW source and apply patches
+        run: |
+          git clone --depth 1 --branch "$ONS_VERSION" https://github.com/timftw21/onscripter-new src
+          for p in engine-mod/*.patch; do
+            echo "applying $p"
+            git -C src apply "$GITHUB_WORKSPACE/$p"
+          done
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake libtool cmake meson ninja-build nasm pkg-config gettext autopoint
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK_VERSION" > /dev/null
+
+      # The 17 dependencies take a long time to build once; keep them between runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            src/Dependencies/onscrlib
+            src/DerivedData
+          key: ons-deps-${{ env.ONS_VERSION }}-arm64-${{ hashFiles('src/Dependencies/pkgs/**') }}
+          restore-keys: |
+            ons-deps-${{ env.ONS_VERSION }}-arm64-
+
+      - name: Build engine
+        working-directory: src
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+        run: |
+          ./configure --droid-build --droid-arch=arm64
+          make -j"$(nproc)"
+
+      - name: Package APK
+        working-directory: src
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
+          ONS_ANDROID_KEYSTORE: ${{ github.workspace }}/app/installer.keystore
+          ONS_ANDROID_KEYSTORE_PASSWORD: android
+          ONS_ANDROID_KEY_ALIAS: installer
+          ONS_ANDROID_KEY_PASSWORD: android
+        run: |
+          make apk
+          find . -name 'onscripter-new.apk' -newer configure -print
+          cp "$(find . -name 'onscripter-new.apk' -newer configure | head -1)" "$GITHUB_WORKSPACE/ons.apk"
+
+      - name: Rename and change icon
+        run: |
+          for v in 2.12.1 2.12.0 2.11.1 2.10.0; do
+            if curl -fsSL -o apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v$v/apktool_$v.jar"; then
+              echo "apktool $v"; break
+            fi
+          done
+          java -jar apktool.jar d -f -o dec ons.apk
+          python3 engine-mod/patch.py dec "$APP_NAME"
+          java -jar apktool.jar b dec -o unsigned.apk
+
+      - name: Align and sign
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          "$BT/zipalign" -p -f 4 unsigned.apk aligned.apk
+          "$BT/apksigner" sign --ks app/installer.keystore --ks-pass pass:android \
+            --ks-key-alias installer --key-pass pass:android \
+            --out Umineko-no-Naku-Koro-ni.apk aligned.apk
+          "$BT/apksigner" verify Umineko-no-Naku-Koro-ni.apk
+          "$BT/aapt2" dump badging Umineko-no-Naku-Koro-ni.apk | grep -E "^(package|application:|native-code)" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Umineko-no-Naku-Koro-ni
+          path: Umineko-no-Naku-Koro-ni.apk
+
+      - name: Publish as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete umineko-engine --yes --cleanup-tag || true
+          gh release create umineko-engine Umineko-no-Naku-Koro-ni.apk \
+            --target "$GITHUB_SHA" \
+            --title "Umineko no Naku Koro ni (ONScripter-NEW ${ONS_VERSION}, Bluetooth audio fix)" \
+            --notes "ONScripter-NEW ${ONS_VERSION} built from source with a bigger audio buffer (fixes stutter on Bluetooth headphones), named \"Umineko no Naku Koro ni\" with the Beatrice icon. Signed with the same key as the earlier renamed build, so it installs as an update over it."
