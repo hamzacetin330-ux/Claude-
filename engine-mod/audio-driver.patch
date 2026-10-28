@@ -1,0 +1,19 @@
+diff --git a/Engine/Core/ONScripter.cpp b/Engine/Core/ONScripter.cpp
+index 2c4627e..6077d36 100644
+--- a/Engine/Core/ONScripter.cpp
++++ b/Engine/Core/ONScripter.cpp
+@@ -558,6 +558,14 @@ void ONScripter::initSDL() {
+ 		lowLatencyDetail = "audio-low-latency=" + lowLatency->second;
+ 	}
+ 	SDL_SetHint(SDL_HINT_ANDROID_LOW_LATENCY_AUDIO, lowLatencyAudio ? "1" : "0");
++	// audiodriver= in ons.cfg must reach SDL3 before the audio subsystem starts
++	// (openAudio() sets the SDL2-era SDL_AUDIODRIVER variable, too late and
++	// under a name SDL3 no longer reads). "openslES" uses the older OpenSL ES
++	// path instead of AAudio, which can add less delay over Bluetooth.
++	if (auto driver = ons_cfg_options.find("audiodriver"); driver != ons_cfg_options.end()) {
++		SDL_SetHint(SDL_HINT_AUDIO_DRIVER, driver->second.c_str());
++		sendToLog(LogLevel::Info, "Audio driver: %s\n", driver->second.c_str());
++	}
+ 	sendToLog(LogLevel::Info, "Audio low-latency mode: %s (%s)\n",
+ 	          lowLatencyAudio ? "on" : "off", lowLatencyDetail.c_str());
+ #endif
