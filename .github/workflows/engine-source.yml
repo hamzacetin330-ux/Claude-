@@ -65,6 +65,18 @@ jobs:
           ./configure --droid-build --droid-arch=arm64
           make -j"$(nproc)"
 
+      - name: Show build logs on failure
+        if: failure()
+        working-directory: src
+        run: |
+          for f in $(find DerivedData -name config.log -newer configure 2>/dev/null | head -5); do
+            echo "=== $f"; grep -n -B2 -A25 "checking whether the C compiler works" "$f" | head -80
+          done
+          for f in $(ls -t DerivedData/*/Dependencies/log/*.log 2>/dev/null | head -2); do
+            echo "=== $f"; tail -n 60 "$f"
+          done
+          ls DerivedData/ndk 2>/dev/null | head; ls DerivedData/ndk/toolchain-* 2>/dev/null | head -20
+
       - name: Package APK
         working-directory: src
         env:
