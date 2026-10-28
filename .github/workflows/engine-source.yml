@@ -62,7 +62,9 @@ jobs:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_HOME }}
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}
         run: |
-          ./configure --droid-build --droid-arch=arm64
+          # Same flags as the project's own Android release (Scripts/quickdroid.tool --release):
+          # PUBLIC_RELEASE makes the engine read the packed *.file game scripts.
+          ./configure --droid-build --droid-arch=arm64 --release-build --strip-binary
           make -j"$(nproc)"
 
       - name: Show build logs on failure
