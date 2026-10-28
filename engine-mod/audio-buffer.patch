@@ -1,5 +1,5 @@
 diff --git a/Support/SDLMixerCompat.cpp b/Support/SDLMixerCompat.cpp
-index 7a795a5..e18f972 100644
+index 7a795a5..b15ffde 100644
 --- a/Support/SDLMixerCompat.cpp
 +++ b/Support/SDLMixerCompat.cpp
 @@ -189,12 +189,27 @@ int Mix_OpenAudio(int frequency, SDL_AudioFormat format, int channelCount, int c
@@ -13,14 +13,14 @@ index 7a795a5..e18f972 100644
  	if (!MIX_Init())
  		return -1;
  
-+	// SDL3 sizes the device buffer from this hint rather than from a chunk size,
-+	// so turn the configured audiobuffer (bytes) into sample frames: in ons.cfg,
-+	// audiobuffer=4 / 8 / 16 gives roughly 1024 / 2048 / 4096 frames. Without
-+	// that line (chunksize is the engine default of 2048 bytes) Android gets
-+	// 2048 frames (~45 ms): SDL's own tiny default underruns on Bluetooth,
++	// SDL3 sizes the device buffer from this hint rather than from a chunk size.
++	// Map ons.cfg's audiobuffer (2..16 kB, even) to sample frames as if it
++	// were 16-bit stereo, whatever format the mixer actually uses, so the
++	// setting means the same everywhere: 8 -> 2048 frames ... 16 -> 4096.
++	// Without that line (chunksize is the engine default of 2048 bytes)
++	// Android gets 2048 frames: SDL's own tiny default underruns on Bluetooth,
 +	// heard as constant stutter, while bigger buffers add noticeable delay.
-+	int frameBytes = static_cast<int>(SDL_AUDIO_BYTESIZE(format)) * std::max(channelCount, 1);
-+	int frames     = frameBytes > 0 ? chunksize / frameBytes : 0;
++	int frames = chunksize / 4;
 +#ifdef DROID
 +	if (chunksize == 2048)
 +		frames = 2048;
